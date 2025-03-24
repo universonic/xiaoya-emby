@@ -8,6 +8,11 @@ RUN make
 
 FROM --platform=linux/arm64 almalinux/9-minimal AS arm64
 
+RUN groupadd -g 568 apps && \
+    useradd -m -u 568 -g apps apps
+
+USER apps
+
 WORKDIR /app
 
 COPY --from=build /app/bin/xiaoya-emby-linux-arm64 /app/bin/xiaoya-emby
@@ -24,6 +29,11 @@ ENTRYPOINT [ "/app/entrypoint.sh" ]
 
 
 FROM --platform=linux/amd64 almalinux/9-minimal AS amd64
+
+RUN groupadd -g 568 apps && \
+    useradd -m -u 568 -g apps apps
+
+USER apps
 
 WORKDIR /app
 
