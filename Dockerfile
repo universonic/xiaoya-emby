@@ -6,7 +6,7 @@ COPY . .
 RUN make
 
 
-FROM --platform=linux/arm64/v8 almalinux/9-minimal AS arm64
+FROM --platform=linux/arm64 almalinux/9-minimal AS arm64
 
 WORKDIR /app
 
