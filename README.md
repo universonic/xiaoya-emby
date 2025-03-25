@@ -2,9 +2,9 @@
 
 Utility to maintain metadata files in xiaoya media library for Emby.
 
-It is an alternative to the `xiaoya-emd` utility, with boosted performance and more feature.
+It is an alternative to the `xiaoya-emd` utility, with boosted performance and emhanced feature.
 
-## Build
+### Build
 
 ```bash
 make
@@ -12,7 +12,7 @@ make
 
 Golang 1.24.x is required.
 
-## Usage (Command-Line)
+### Usage (Command-Line)
 
 ```txt
 Utility to maintain metadata files in xiaoya media library for Emby
@@ -33,14 +33,14 @@ Flags:
       --run-interval-in-hour int      Hours between two run cycles. Ignored unless run as daemon. (default 24)
 ```
 
-## Kickstart
+### Kickstart
 
 This software requires a download folder and a media folder. It downloads metadata from mirrors, and modify the URLs in `.strm` files (if necessary, specified by `-r` and `-u`), then copy them to media folder. You should expose the media folder to your Emby server.
 
 Simply start your container with:
 
 ```bash
-docker run -d --name xiaoya-emby -v ${MY_DOWNLOAD_FOLDER}:/download -v ${MY_MEDIA_FOLDER}:/media universonic/xiaoya-emd
+docker run -d --name xiaoya-emby -v ${MY_DOWNLOAD_FOLDER}:/download -v ${MY_MEDIA_FOLDER}:/media universonic/xiaoya-emby
 ```
 
 Enjoy!
