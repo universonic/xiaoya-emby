@@ -117,6 +117,7 @@ METADATA:
 		if err != nil {
 			if cfg.RunAsDaemon {
 				log.Printf("[ERROR] Critical error: %v", err)
+				time.Sleep(time.Second * 5)
 				goto METADATA
 			}
 			ecodeCh <- 2
@@ -130,6 +131,7 @@ METADATA:
 		if err != nil {
 			if cfg.RunAsDaemon {
 				log.Printf("[ERROR] Critical error: %v", err)
+				time.Sleep(time.Second * 5)
 				goto METADATA
 			}
 			ecodeCh <- 2
@@ -145,6 +147,7 @@ ALIST:
 		if err != nil {
 			if cfg.RunAsDaemon {
 				log.Printf("[ERROR] Critical error: %v", err)
+				time.Sleep(time.Second * 5)
 				goto ALIST
 			}
 			ecodeCh <- 3
@@ -157,6 +160,7 @@ ALIST:
 		if err != nil {
 			if cfg.RunAsDaemon {
 				log.Printf("[ERROR] Critical error: %v", err)
+				time.Sleep(time.Second * 5)
 				goto ALIST
 			}
 			ecodeCh <- 3
@@ -178,6 +182,7 @@ COMPARE:
 	if err != nil {
 		if cfg.RunAsDaemon {
 			log.Printf("[ERROR] Critical error: %v", err)
+			time.Sleep(time.Second * 5)
 			goto COMPARE
 		}
 		ecodeCh <- 126
@@ -195,6 +200,7 @@ UPDATE:
 	if err != nil {
 		if cfg.RunAsDaemon {
 			log.Printf("[ERROR] Critical error: %v", err)
+			time.Sleep(time.Second * 5)
 			goto UPDATE
 		}
 		ecodeCh <- 127
@@ -208,6 +214,7 @@ SYNC:
 	if err != nil {
 		if cfg.RunAsDaemon {
 			log.Printf("[ERROR] Critical error: %v", err)
+			time.Sleep(time.Second * 5)
 			goto SYNC
 		}
 		ecodeCh <- 128
@@ -502,6 +509,11 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 
 	log.Println("[INFO] Finalizing updates...")
 
+	o, err := url.Parse(cfg.AlistURL)
+	if err != nil {
+		return err
+	}
+
 	for strm := range strmList {
 		fpath := filepath.Join(cfg.DownloadDir, strm)
 		dir := filepath.Dir(fpath)
@@ -514,22 +526,17 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 			return err
 		}
 
-		s := string(bytes.TrimSpace(p))
-		if strings.HasPrefix(s, defaultAlistEndpoint) {
-			relUrl := strings.TrimPrefix(s, defaultAlistEndpoint)
-			relUrl = "/" + strings.TrimPrefix(relUrl, "/")
-
-			if strings.HasPrefix(relUrl, defaultAlistStrmRootPath) {
-				relpath := strings.TrimPrefix(relUrl, defaultAlistStrmRootPath)
-				relpath = strings.TrimPrefix(relpath, "/")
-
-				relUrl = "/" + strings.TrimPrefix(cfg.AlistStrmRootPath, "/") + "/" + relpath
-			}
-
-			s = strings.TrimSuffix(cfg.AlistURL, "/") + relUrl
-		}
+		s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
 		u, err := url.Parse(s)
 		if err == nil {
+			s = u.String()
+		}
+
+		if strings.HasPrefix(s, defaultAlistEndpoint) {
+			relUrl := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
+			relUrl = "/" + strings.TrimPrefix(cfg.AlistStrmRootPath, "/") + "/" + strings.TrimPrefix(relUrl, "/")
+
+			u.Scheme, u.Opaque, u.User, u.Host, u.Path = o.Scheme, o.Opaque, o.User, o.Host, relUrl
 			s = u.String()
 		}
 

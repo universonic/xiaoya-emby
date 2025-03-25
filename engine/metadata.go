@@ -94,6 +94,8 @@ func NewMetadataCrawler(downloadDir string, mirrors, selectedPaths, ignoredDirs,
 
 	if len(mirrors) == 0 {
 		mc.mirrors = sMirrors
+	} else {
+		mc.mirrors = mirrors
 	}
 	var err error
 	for range 3 {
