@@ -372,7 +372,7 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 				}
 				return nil, nil, err
 			}
-			s := string(bytes.TrimSpace(p))
+			s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
 			u, err := url.Parse(s)
 			if err != nil {
 				log.Printf("[ERROR] Stream cannot be verified: [%s] %v", s, err)
@@ -380,8 +380,7 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 				continue
 			}
 
-			linkpath := "/" + strings.TrimPrefix(strings.TrimPrefix(u.Path, defaultAlistStrmRootPath), "/")
-			linkpath = strings.ReplaceAll(linkpath, "%20", " ")
+			linkpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
 			if ok := alistMap[linkpath]; ok {
 				dirToCopy[path] = true
 				valids++
