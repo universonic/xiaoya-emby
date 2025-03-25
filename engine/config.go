@@ -44,67 +44,14 @@ type Config struct {
 	alistClient *AlistClient
 }
 
-func (cfg *Config) getAllAlistFilesOnDemand() ([]*MetadataFile, error) {
-	if err := os.MkdirAll(cfg.MediaDir, dirPerm); err != nil {
-		return nil, err
-	}
-	fpath := filepath.Join(cfg.MediaDir, ".alist.db")
-	fi, err := os.Stat(fpath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg.generateAndCacheAlistFiles()
-		}
-
-		return nil, err
-	}
-
-	if time.Since(fi.ModTime()) > time.Hour*24 {
-		os.Remove(fpath)
-		return cfg.generateAndCacheAlistFiles()
-	}
-
-	files, err := cfg.listAlistFilesFromCache()
-	if err != nil {
-		return nil, err
-	}
-	if len(files) > 0 {
-		return files, nil
-	}
-
-	os.Remove(fpath)
-	return cfg.generateAndCacheAlistFiles()
-}
-
-func (cfg *Config) listAlistFilesFromCache() ([]*MetadataFile, error) {
-	log.Println("[INFO] Read Alist manifests from cache...")
-
-	db, err := sql.Open("sqlite3", filepath.Join(cfg.MediaDir, ".alist.db"))
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	if err = createFileTable(db); err != nil {
-		return nil, err
-	}
-	return listFiles(db)
-}
-
-func (cfg *Config) generateAndCacheAlistFiles() ([]*MetadataFile, error) {
-	if err := cfg.generateAlistDB(); err != nil {
-		return nil, err
-	}
-	return cfg.listAlistFilesFromCache()
-}
-
 func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
 	if cfg.alistClient == nil {
 		cfg.alistClient, _ = NewAlistClient(cfg.AlistURL)
 	}
 
 	var (
-		remote, alistFiles []*MetadataFile
-		err                error
+		remote []*MetadataFile
+		err    error
 	)
 
 	if cfg.RunAsDaemon {
@@ -141,35 +88,6 @@ METADATA:
 		log.Println("[INFO] Skipped metadata download.")
 	}
 
-ALIST:
-	if cfg.RunMode&2 == 2 {
-		alistFiles, err = cfg.getAllAlistFilesOnDemand()
-		if err != nil {
-			if cfg.RunAsDaemon {
-				log.Printf("[ERROR] Critical error: %v", err)
-				time.Sleep(time.Second * 5)
-				goto ALIST
-			}
-			ecodeCh <- 3
-			errCh <- err
-			return
-		}
-		log.Printf("[INFO] Found %d Alist file(s) in total.", len(alistFiles))
-	} else {
-		alistFiles, err = cfg.listAlistFilesFromCache()
-		if err != nil {
-			if cfg.RunAsDaemon {
-				log.Printf("[ERROR] Critical error: %v", err)
-				time.Sleep(time.Second * 5)
-				goto ALIST
-			}
-			ecodeCh <- 3
-			errCh <- err
-			return
-		}
-		log.Printf("[INFO] Found %d Alist file(s) in total (cached).", len(alistFiles))
-	}
-
 	if cfg.RunMode&1 != 1 {
 		ecodeCh <- 0
 		errCh <- nil
@@ -177,7 +95,7 @@ ALIST:
 	}
 
 COMPARE:
-	filesToPreserve, err := cfg.compareMetadata(remote, alistFiles)
+	filesToPreserve, err := cfg.compareMetadata(remote)
 	if err != nil {
 		if cfg.RunAsDaemon {
 			log.Printf("[ERROR] Critical error: %v", err)
@@ -296,7 +214,7 @@ func (cfg *Config) generateAlistDB() error {
 	return tx.Commit()
 }
 
-func (cfg *Config) compareMetadata(files, alistFiles []*MetadataFile) (map[string]bool, error) {
+func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, error) {
 	strmMap := make(map[string]map[string]bool)
 	fullMap := make(map[string]map[string]bool)
 	for _, file := range files {
@@ -324,11 +242,6 @@ func (cfg *Config) compareMetadata(files, alistFiles []*MetadataFile) (map[strin
 	validDirs := 0
 	rootDirMap := make(map[string]int)
 	strmToSkip := make(map[string]bool)
-	alistMap := make(map[string]bool)
-
-	for _, file := range alistFiles {
-		alistMap[file.Path()] = true
-	}
 
 	for path, strmsMap := range strmMap {
 		valids := 0
@@ -349,13 +262,22 @@ func (cfg *Config) compareMetadata(files, alistFiles []*MetadataFile) (map[strin
 				continue
 			}
 
-			linkpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
-			if ok := alistMap[linkpath]; ok {
-				valids++
-			} else if cfg.Purge {
-				strmToSkip[fpath] = true
-				log.Printf("[WARN] Absent stream on Alist: %s", linkpath)
+			alistpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
+			_, err = cfg.alistClient.Stat(alistpath)
+			if err != nil {
+				if cfg.Purge {
+					strmToSkip[fpath] = true
+				}
+
+				if os.IsNotExist(err) {
+					log.Printf("[WARN] Absent stream [%s] on Alist.", alistpath)
+					continue
+				}
+
+				log.Printf("[ERROR] Cannot verify stream [%s] on Alist: %v", alistpath, err)
+				continue
 			}
+			valids++
 		}
 		if valids > 0 {
 			rootDirMap[getRootDir(path, cfg.MediaDir)]++
@@ -571,7 +493,7 @@ func (cfg *Config) Command() *cobra.Command {
 			}
 		},
 	}
-	cmd.Flags().IntVar(&cfg.RunMode, "mode", 7, "Run mode (4: scan metadata, 2: scan alist, 1: sync metadata)")
+	cmd.Flags().IntVar(&cfg.RunMode, "mode", 7, "Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata)")
 	cmd.Flags().BoolVar(&cfg.RunAsDaemon, "daemon", true, "Run as daemon in foreground")
 	cmd.Flags().IntVar(&cfg.RunIntervalInHour, "run-interval-in-hour", 24, "Hours between two run cycles. Ignored unless run as daemon.")
 	cmd.Flags().StringVarP(&cfg.MediaDir, "media-dir", "d", "/media", "Media directory of Emby to maintain metadata")

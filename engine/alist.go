@@ -83,6 +83,9 @@ func (c *AlistClient) Stat(path string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	if r.Data == nil {
+		return nil, fs.ErrNotExist
+	}
 	return AlistFile{
 		path:     path,
 		name:     r.Data.Name,
@@ -227,9 +230,9 @@ type AlistGetPayload struct {
 }
 
 type AlistGetResult struct {
-	Code    int                `json:"code"`
-	Data    AlistGetResultData `json:"data"`
-	Message string             `json:"message"`
+	Code    int                 `json:"code"`
+	Data    *AlistGetResultData `json:"data"`
+	Message string              `json:"message"`
 }
 
 type AlistGetResultData struct {
