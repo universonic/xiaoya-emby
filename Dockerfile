@@ -20,7 +20,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 
 ENV ALIST_STRM_ROOT_PATH="/d"
 ENV ALIST_URL="http://xiaoya.host:5678"
-ENV RUN_INTERVAL_IN_HOUR="24"
+ENV RUN_CRON_EXPR="0 0 * * *"
 
 VOLUME /download
 VOLUME /media
@@ -42,7 +42,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 
 ENV ALIST_STRM_ROOT_PATH="/d"
 ENV ALIST_URL="http://xiaoya.host:5678"
-ENV RUN_INTERVAL_IN_HOUR="24"
+ENV RUN_CRON_EXPR="0 0 * * *"
 
 VOLUME /download
 VOLUME /media

@@ -27,10 +27,10 @@ Flags:
   -D, --download-dir string           Media directory of Emby to download metadata to (default "/download")
   -h, --help                          Print this message
   -d, --media-dir string              Media directory of Emby to maintain metadata (default "/media")
-  -m, --mirror-url string             Specify the mirror URL to sync metadata from
-      --mode int                      Run mode (4: scan metadata, 2: scan alist, 1: sync metadata) (default 7)
+  -m, --mirror-url strings            Specify the mirror URL to sync metadata from
+      --mode int                      Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata) (default 7)
   -p, --purge                         Whether to purge useless file or directory when media is no longer available (default true)
-      --run-interval-in-hour int      Hours between two run cycles. Ignored unless run as daemon. (default 24)
+      --run-cron string               Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
 ```
 
 ### Kickstart

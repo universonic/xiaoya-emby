@@ -15,11 +15,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	cron "github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
-)
-
-var (
-	Version = "v0.1.0"
 )
 
 const (
@@ -31,7 +28,7 @@ const (
 type Config struct {
 	RunMode           int
 	RunAsDaemon       bool
-	RunIntervalInHour int
+	RunCron           string
 	MediaDir          string
 	DownloadDir       string
 	Purge             bool
@@ -134,8 +131,10 @@ SYNC:
 	}
 
 	if cfg.RunAsDaemon {
-		d := time.Hour * time.Duration(cfg.RunIntervalInHour)
-		log.Printf("[INFO] Next task will be started at: %s. Waiting for %d hours...", time.Now().Add(d).Format(time.RFC3339), cfg.RunIntervalInHour)
+		sche, _ := cron.ParseStandard(cfg.RunCron)
+		next := sche.Next(time.Now())
+		d := time.Until(next)
+		log.Printf("[INFO] Next task will be started at: %s. Waiting for %v...", next.Format(time.RFC3339), d)
 		time.Sleep(d)
 		goto METADATA
 	}
@@ -144,7 +143,7 @@ SYNC:
 }
 
 func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
-	log.Println("[INFO] Start metadata synchronization...")
+	log.Println("[INFO] Start metadata download...")
 	crawler, err := NewMetadataCrawler(cfg.DownloadDir, cfg.MirrorURL, nil, nil, nil, cfg.Purge)
 	if err != nil {
 		return nil, err
@@ -192,39 +191,44 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 
 	for path, strmsMap := range strmMap {
 		valids := 0
-		for strm := range strmsMap {
-			fpath := filepath.Join(path, strm)
-			p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
-			if err != nil {
-				if os.IsNotExist(err) {
-					continue
+		if cfg.Purge {
+			for strm := range strmsMap {
+				fpath := filepath.Join(path, strm)
+				p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
+				if err != nil {
+					if os.IsNotExist(err) {
+						continue
+					}
+					return nil, err
 				}
-				return nil, err
-			}
-			s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
-			u, err := url.Parse(s)
-			if err != nil {
-				log.Printf("[ERROR] Stream cannot be verified: [%s] %v", s, err)
-				strmToSkip[fpath] = true
-				continue
-			}
 
-			alistpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
-			_, err = cfg.alistClient.Stat(alistpath)
-			if err != nil {
-				if cfg.Purge {
+				s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
+				u, err := url.Parse(s)
+				if err != nil {
+					log.Printf("[ERROR] Stream [%s] cannot be verified: %v", s, err)
 					strmToSkip[fpath] = true
-				}
-
-				if os.IsNotExist(err) {
-					log.Printf("[WARN] Absent stream [%s] on Alist.", alistpath)
 					continue
 				}
 
-				log.Printf("[ERROR] Cannot verify stream [%s] on Alist: %v", alistpath, err)
-				continue
+				alistpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
+
+				_, err = cfg.alistClient.Stat(alistpath)
+				if err != nil {
+					strmToSkip[fpath] = true
+
+					if os.IsNotExist(err) {
+						log.Printf("[WARN] Absent stream [%s] on Alist.", alistpath)
+						continue
+					}
+
+					log.Printf("[ERROR] Cannot verify stream [%s] on Alist: %v", alistpath, err)
+					continue
+				}
+
+				valids++
 			}
-			valids++
+		} else {
+			valids = len(strmsMap)
 		}
 		if valids > 0 {
 			rootDirMap[getRootDir(path, cfg.MediaDir)]++
@@ -415,9 +419,10 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 
 func (cfg *Config) Command() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "xiaoya-emby",
-		Short: "Xiaoya utility for Emby",
-		Long:  `Utility to maintain metadata files in xiaoya media library for Emby`,
+		Use:     "xiaoya-emby",
+		Short:   "Xiaoya utility for Emby",
+		Long:    `Utility to maintain metadata files in xiaoya media library for Emby`,
+		Version: Version,
 		Run: func(cmd *cobra.Command, args []string) {
 			ecode, err := cfg.Validate()
 			if err != nil {
@@ -440,13 +445,15 @@ func (cfg *Config) Command() *cobra.Command {
 			}
 		},
 	}
+	var version bool
 	cmd.Flags().IntVar(&cfg.RunMode, "mode", 7, "Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata)")
 	cmd.Flags().BoolVar(&cfg.RunAsDaemon, "daemon", true, "Run as daemon in foreground")
-	cmd.Flags().IntVar(&cfg.RunIntervalInHour, "run-interval-in-hour", 24, "Hours between two run cycles. Ignored unless run as daemon.")
+	cmd.Flags().StringVar(&cfg.RunCron, "cron-expr", "0 0 * * *", "Cron expression as scheduled task. Must run as daemon.")
 	cmd.Flags().StringVarP(&cfg.MediaDir, "media-dir", "d", "/media", "Media directory of Emby to maintain metadata")
 	cmd.Flags().StringVarP(&cfg.DownloadDir, "download-dir", "D", "/download", "Media directory of Emby to download metadata to")
 	cmd.Flags().BoolVarP(&cfg.Purge, "purge", "p", true, "Whether to purge useless file or directory when media is no longer available")
 	cmd.Flags().BoolVarP(&cfg.Help, "help", "h", false, "Print this message")
+	cmd.Flags().BoolVarP(&version, "version", "v", false, "Print software version")
 	cmd.Flags().StringSliceVarP(&cfg.MirrorURL, "mirror-url", "m", nil, "Specify the mirror URL to sync metadata from")
 	cmd.Flags().StringVarP(&cfg.AlistURL, "alist-url", "u", defaultAlistEndpoint, "Endpoint of xiaoya Alist. Change this value will result to url overide in strm file")
 	cmd.Flags().StringVarP(&cfg.AlistStrmRootPath, "alist-strm-root-path", "r", defaultAlistStrmRootPath, "Root path of strm files in xiaoya Alist")
@@ -462,6 +469,11 @@ func (cfg *Config) Validate() (int, error) {
 	}
 	if u.Path != "/" {
 		return 2, fmt.Errorf("alist url must be root path: %s", cfg.AlistURL)
+	}
+
+	_, err = cron.ParseStandard(cfg.RunCron)
+	if err != nil {
+		return 2, fmt.Errorf("invalid cron expression: %s", cfg.RunCron)
 	}
 
 	return 0, nil
