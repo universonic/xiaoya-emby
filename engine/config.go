@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -192,6 +193,12 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 	for path, strmsMap := range strmMap {
 		valids := 0
 		if cfg.Purge {
+			var (
+				wg  sync.WaitGroup
+				mux sync.Mutex
+			)
+			workerChan := make(chan struct{}, defaultWorkers())
+
 			for strm := range strmsMap {
 				fpath := filepath.Join(path, strm)
 				p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
@@ -212,21 +219,33 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 
 				alistpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
 
-				_, err = cfg.alistClient.Stat(alistpath)
-				if err != nil {
-					strmToSkip[fpath] = true
+				wg.Add(1)
+				go func(alistpath, fpath string) {
+					defer wg.Done()
 
-					if os.IsNotExist(err) {
-						log.Printf("[WARN] Absent stream [%s] on Alist.", alistpath)
-						continue
+					workerChan <- struct{}{}
+					defer func() { <-workerChan }()
+
+					_, err = cfg.alistClient.Stat(alistpath)
+					if err != nil {
+						mux.Lock()
+						defer mux.Unlock()
+
+						strmToSkip[fpath] = true
+
+						if os.IsNotExist(err) {
+							log.Printf("[WARN] Absent stream [%s] on Alist.", alistpath)
+							return
+						}
+
+						log.Printf("[ERROR] Cannot verify stream [%s] on Alist: %v", alistpath, err)
 					}
-
-					log.Printf("[ERROR] Cannot verify stream [%s] on Alist: %v", alistpath, err)
-					continue
-				}
+				}(alistpath, fpath)
 
 				valids++
 			}
+
+			wg.Wait()
 		} else {
 			valids = len(strmsMap)
 		}
