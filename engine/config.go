@@ -37,7 +37,7 @@ type Config struct {
 	DownloadDir       string
 	Purge             bool
 	Help              bool
-	MirrorURL         string
+	MirrorURL         []string
 	AlistURL          string
 	AlistStrmRootPath string
 
@@ -245,17 +245,8 @@ func deleteDirIfNoSubDir(dir string) error {
 }
 
 func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
-	var mirrors []string
-	if cfg.MirrorURL != "" {
-		if t := validateMirror(cfg.MirrorURL); t == 0 {
-			log.Printf("[WARN] mirror %s is invalid. Using default mirrors...", cfg.MirrorURL)
-		} else {
-			mirrors = append(mirrors, cfg.MirrorURL)
-		}
-	}
-
 	log.Println("[INFO] Start metadata synchronization...")
-	crawler, err := NewMetadataCrawler(cfg.DownloadDir, mirrors, nil, nil, nil, cfg.Purge)
+	crawler, err := NewMetadataCrawler(cfg.DownloadDir, cfg.MirrorURL, nil, nil, nil, cfg.Purge)
 	if err != nil {
 		return nil, err
 	}
@@ -625,7 +616,7 @@ func (cfg *Config) Command() *cobra.Command {
 	cmd.Flags().StringVarP(&cfg.DownloadDir, "download-dir", "D", "/download", "Media directory of Emby to download metadata to")
 	cmd.Flags().BoolVarP(&cfg.Purge, "purge", "p", true, "Whether to purge useless file or directory when media is no longer available")
 	cmd.Flags().BoolVarP(&cfg.Help, "help", "h", false, "Print this message")
-	cmd.Flags().StringVarP(&cfg.MirrorURL, "mirror-url", "m", "", "Specify the mirror URL to sync metadata from")
+	cmd.Flags().StringSliceVarP(&cfg.MirrorURL, "mirror-url", "m", nil, "Specify the mirror URL to sync metadata from")
 	cmd.Flags().StringVarP(&cfg.AlistURL, "alist-url", "u", defaultAlistEndpoint, "Endpoint of xiaoya Alist. Change this value will result to url overide in strm file")
 	cmd.Flags().StringVarP(&cfg.AlistStrmRootPath, "alist-strm-root-path", "r", defaultAlistStrmRootPath, "Root path of strm files in xiaoya Alist")
 	return cmd
