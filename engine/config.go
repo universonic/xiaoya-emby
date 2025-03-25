@@ -190,13 +190,13 @@ COMPARE:
 	}
 	log.Printf("[INFO] %d metadata files to sync.", len(filesToPreserve))
 
-UPDATE:
+PREPARE:
 	filesNeedUpdate, err := cfg.prepareMetadataUpdate(filesToPreserve)
 	if err != nil {
 		if cfg.RunAsDaemon {
 			log.Printf("[ERROR] Critical error: %v", err)
 			time.Sleep(time.Second * 5)
-			goto UPDATE
+			goto PREPARE
 		}
 		ecodeCh <- 127
 		errCh <- err
