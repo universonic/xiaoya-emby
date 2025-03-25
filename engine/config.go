@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/url"
 	"os"
@@ -160,58 +159,6 @@ func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
 	}
 
 	return crawler.LocalFiles()
-}
-
-func (cfg *Config) generateAlistDB() error {
-	log.Println("[INFO] Collecting available Alist files...")
-	defer log.Println("[INFO] Collected Alist files.")
-
-	db, err := sql.Open("sqlite3", filepath.Join(cfg.MediaDir, ".alist.db"))
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	if err = createFileTable(db); err != nil {
-		return err
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if err = cfg.alistClient.Walk("/", func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			if _, ok := err.(*fs.PathError); ok {
-				log.Println("[WARN] Error validating Alist file:", err)
-				return nil
-			}
-			log.Println("[ERROR] Error validating Alist file:", err)
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-
-		stmt, err := tx.Prepare("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)")
-		if err != nil {
-			return err
-		}
-		defer stmt.Close()
-
-		_, err = stmt.Exec(path, filepath.Base(path), info.Size(), info.ModTime().Unix(), info.IsDir())
-		if err != nil {
-			return err
-		}
-
-		log.Printf("[INFO] Verified file on Alist [%v]: %s", cfg.alistClient.Endpoint, path)
-		return nil
-	}); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, error) {
