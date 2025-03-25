@@ -177,8 +177,7 @@ ALIST:
 	}
 
 COMPARE:
-	strmMap, metadataMap := cfg.mapMetadataFiles(remote)
-	filesToPreserve, dirToRemove, err := cfg.compareMetadata(metadataMap, strmMap, alistFiles)
+	filesToPreserve, err := cfg.compareMetadata(remote, alistFiles)
 	if err != nil {
 		if cfg.RunAsDaemon {
 			log.Printf("[ERROR] Critical error: %v", err)
@@ -189,11 +188,7 @@ COMPARE:
 		errCh <- err
 		return
 	}
-	log.Printf("[INFO] %d metadata files to sync, %d directories to remove.", len(filesToPreserve), len(dirToRemove))
-
-	for dir := range dirToRemove {
-		deleteDirIfNoSubDir(dir)
-	}
+	log.Printf("[INFO] %d metadata files to sync.", len(filesToPreserve))
 
 UPDATE:
 	filesNeedUpdate, err := cfg.prepareMetadataUpdate(filesToPreserve)
@@ -231,19 +226,6 @@ SYNC:
 	errCh <- nil
 }
 
-func deleteDirIfNoSubDir(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return nil
-		}
-	}
-	return os.RemoveAll(dir)
-}
-
 func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
 	log.Println("[INFO] Start metadata synchronization...")
 	crawler, err := NewMetadataCrawler(cfg.DownloadDir, cfg.MirrorURL, nil, nil, nil, cfg.Purge)
@@ -260,34 +242,6 @@ func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
 	}
 
 	return crawler.LocalFiles()
-}
-
-// mapMetadataFiles maps directory path to files that it contains.
-func (cfg *Config) mapMetadataFiles(files []*MetadataFile) (strmMap, fullMap map[string]map[string]bool) {
-	strmMap = make(map[string]map[string]bool)
-	fullMap = make(map[string]map[string]bool)
-	for _, file := range files {
-		fpath := file.Path()
-		dir := filepath.Dir(fpath)
-		fname := filepath.Base(fpath)
-		m := fullMap[dir]
-		if m == nil {
-			m = make(map[string]bool)
-		}
-		m[fname] = true
-		fullMap[dir] = m
-
-		ext := filepath.Ext(fname)
-		if ext == ".strm" {
-			m := strmMap[dir]
-			if m == nil {
-				m = make(map[string]bool)
-			}
-			m[fname] = true
-			strmMap[dir] = m
-		}
-	}
-	return
 }
 
 func (cfg *Config) generateAlistDB() error {
@@ -342,11 +296,33 @@ func (cfg *Config) generateAlistDB() error {
 	return tx.Commit()
 }
 
-func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bool, alistFiles []*MetadataFile) (map[string]bool, map[string]bool, error) {
-	i := 0
+func (cfg *Config) compareMetadata(files, alistFiles []*MetadataFile) (map[string]bool, error) {
+	strmMap := make(map[string]map[string]bool)
+	fullMap := make(map[string]map[string]bool)
+	for _, file := range files {
+		fpath := file.Path()
+		dir := filepath.Dir(fpath)
+		fname := filepath.Base(fpath)
+		m := fullMap[dir]
+		if m == nil {
+			m = make(map[string]bool)
+		}
+		m[fname] = true
+		fullMap[dir] = m
+
+		ext := filepath.Ext(fname)
+		if ext == ".strm" {
+			m := strmMap[dir]
+			if m == nil {
+				m = make(map[string]bool)
+			}
+			m[fname] = true
+			strmMap[dir] = m
+		}
+	}
+
 	validDirs := 0
 	rootDirMap := make(map[string]int)
-	dirToCopy := make(map[string]bool)
 	strmToSkip := make(map[string]bool)
 	alistMap := make(map[string]bool)
 
@@ -356,7 +332,6 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 
 	for path, strmsMap := range strmMap {
 		valids := 0
-		i++
 		for strm := range strmsMap {
 			fpath := filepath.Join(path, strm)
 			p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
@@ -364,7 +339,7 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 				if os.IsNotExist(err) {
 					continue
 				}
-				return nil, nil, err
+				return nil, err
 			}
 			s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
 			u, err := url.Parse(s)
@@ -376,7 +351,6 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 
 			linkpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
 			if ok := alistMap[linkpath]; ok {
-				dirToCopy[path] = true
 				valids++
 			} else if cfg.Purge {
 				strmToSkip[fpath] = true
@@ -390,12 +364,7 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 	}
 
 	filesToPreserve := make(map[string]bool)
-	for dir := range dirToCopy {
-		files := metadataMap[dir]
-		if files == nil {
-			continue
-		}
-
+	for dir, files := range fullMap {
 		for file := range files {
 			fpath := filepath.Join(dir, file)
 			if ok := strmToSkip[fpath]; ok {
@@ -406,19 +375,12 @@ func (cfg *Config) compareMetadata(metadataMap, strmMap map[string]map[string]bo
 		}
 	}
 
-	dirToRemove := make(map[string]bool)
-	for path := range strmToSkip {
-		dir := filepath.Dir(path)
-		if ok := dirToCopy[dir]; !ok {
-			dirToRemove[dir] = true
-		}
-	}
 	p, err := json.MarshalIndent(rootDirMap, "", "  ")
 	if err == nil {
 		log.Printf("[INFO] Valid metadata directories =>\n%s\n", p)
 	}
 	log.Printf("[INFO] %d/%d valid metadata directories in total.\n", validDirs, len(strmMap))
-	return filesToPreserve, dirToRemove, nil
+	return filesToPreserve, nil
 }
 
 func (cfg *Config) prepareMetadataUpdate(filesToPreserve map[string]bool) (map[string]bool, error) {
@@ -458,7 +420,7 @@ func (cfg *Config) prepareMetadataUpdate(filesToPreserve map[string]bool) (map[s
 			defer tx.Rollback()
 
 			deleteFile(tx, f)
-			deleteDirIfNoSubDir(filepath.Dir(f.Path()))
+			deleteDirIfEmpty(filepath.Dir(f.Path()))
 		}
 	}
 
