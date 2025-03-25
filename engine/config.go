@@ -273,23 +273,19 @@ func (cfg *Config) mapMetadataFiles(files []*MetadataFile) (strmMap, fullMap map
 		dir := filepath.Dir(fpath)
 		fname := filepath.Base(fpath)
 		m := fullMap[dir]
-		if m != nil {
-			m[fname] = true
-		} else {
+		if m == nil {
 			m = make(map[string]bool)
-			m[fname] = true
 		}
+		m[fname] = true
 		fullMap[dir] = m
 
 		ext := filepath.Ext(fname)
 		if ext == ".strm" {
 			m := strmMap[dir]
-			if m != nil {
-				m[fname] = true
-			} else {
+			if m == nil {
 				m = make(map[string]bool)
-				m[fname] = true
 			}
+			m[fname] = true
 			strmMap[dir] = m
 		}
 	}
