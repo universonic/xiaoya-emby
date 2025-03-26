@@ -157,9 +157,12 @@ func (c *AlistClient) ReadDir(path string) ([]os.FileInfo, error) {
 	var files []os.FileInfo
 	count, total := 0, 1
 	for i := 1; count < total; i++ {
-		r, err := c.list(path, i, 64)
+		r, err := c.list(path, i, 1024)
 		if err != nil {
 			return nil, err
+		}
+		if r.Data == nil {
+			return nil, fs.ErrNotExist
 		}
 		n := len(r.Data.Content)
 		count += n
@@ -255,9 +258,9 @@ type AlistListPayload struct {
 }
 
 type AlistListResult struct {
-	Code    int                 `json:"code"`
-	Data    AlistListResultData `json:"data"`
-	Message string              `json:"message"`
+	Code    int                  `json:"code"`
+	Data    *AlistListResultData `json:"data"`
+	Message string               `json:"message"`
 }
 
 type AlistListResultData struct {

@@ -186,71 +186,101 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 		}
 	}
 
-	validDirs := 0
+	var (
+		wg        sync.WaitGroup
+		mux       sync.Mutex
+		validDirs int
+	)
 	rootDirMap := make(map[string]int)
 	strmToSkip := make(map[string]bool)
+	pathToScan := make(map[string]map[string]string)
+	workerChan := make(chan struct{}, defaultWorkers())
 
 	for path, strmsMap := range strmMap {
-		valids := 0
-		if cfg.Purge {
-			var (
-				wg  sync.WaitGroup
-				mux sync.Mutex
-			)
-			workerChan := make(chan struct{}, defaultWorkers())
+		if !cfg.Purge {
+			rootDirMap[getRootDir(path, cfg.MediaDir)]++
+			validDirs++
+		}
 
-			for strm := range strmsMap {
-				fpath := filepath.Join(path, strm)
-				p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
-				if err != nil {
-					if os.IsNotExist(err) {
-						continue
-					}
-					return nil, err
-				}
-
-				s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
-				u, err := url.Parse(s)
-				if err != nil {
-					log.Printf("[ERROR] Stream [%s] cannot be verified: %v", s, err)
-					strmToSkip[fpath] = true
+		for strm := range strmsMap {
+			fpath := filepath.Join(path, strm)
+			p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
+			if err != nil {
+				if os.IsNotExist(err) {
 					continue
 				}
-
-				alistpath := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
-
-				wg.Add(1)
-				go func(alistpath, fpath string) {
-					defer wg.Done()
-
-					workerChan <- struct{}{}
-					defer func() { <-workerChan }()
-
-					_, err = cfg.alistClient.Stat(alistpath)
-					if err != nil {
-						mux.Lock()
-						defer mux.Unlock()
-
-						strmToSkip[fpath] = true
-
-						if os.IsNotExist(err) {
-							log.Printf("[WARN] Absent stream [%s] on Alist.", alistpath)
-							return
-						}
-
-						log.Printf("[ERROR] Cannot verify stream [%s] on Alist: %v", alistpath, err)
-					}
-				}(alistpath, fpath)
-
-				valids++
+				return nil, err
 			}
 
-			wg.Wait()
-		} else {
-			valids = len(strmsMap)
+			s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
+			if strings.HasPrefix(s, defaultAlistEndpoint) {
+				relpath := "/" + strings.TrimPrefix(strings.TrimPrefix(s, defaultAlistEndpoint), "/")
+				relUrl := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(relpath, "/"), defaultAlistStrmRootPath), "/")
+
+				alistdir := filepath.Dir(relUrl)
+				alistfile := filepath.Base(relUrl)
+				alistfiles := pathToScan[alistdir]
+				if alistfiles == nil {
+					alistfiles = make(map[string]string)
+				}
+				alistfiles[alistfile] = fpath
+				pathToScan[alistdir] = alistfiles
+			}
 		}
-		if valids > 0 {
-			rootDirMap[getRootDir(path, cfg.MediaDir)]++
+	}
+
+	if cfg.Purge {
+		fdirMap := make(map[string]int)
+		for alistdir, alistfiles := range pathToScan {
+			wg.Add(1)
+			go func(alistpath string, alistfiles map[string]string) {
+				defer wg.Done()
+
+				workerChan <- struct{}{}
+				defer func() { <-workerChan }()
+
+				files, err := cfg.alistClient.ReadDir(alistpath)
+				if err != nil {
+					mux.Lock()
+					defer mux.Unlock()
+
+					for _, fpath := range alistfiles {
+						strmToSkip[fpath] = true
+					}
+
+					if os.IsNotExist(err) {
+						log.Printf("[WARN] Absent stream folder [%s] on Alist.", alistpath)
+						return
+					}
+
+					log.Printf("[ERROR] Cannot verify stream folder [%s] on Alist: %v", alistpath, err)
+					return
+				}
+
+				mux.Lock()
+				defer mux.Unlock()
+
+				m := make(map[string]bool)
+				for _, file := range files {
+					alistfile := file.Name()
+					m[alistfile] = true
+				}
+
+				for alistfile, fpath := range alistfiles {
+					if m[alistfile] {
+						fdirMap[filepath.Dir(fpath)]++
+						continue
+					}
+					strmToSkip[fpath] = true
+					log.Printf("[WARN] Absent stream [%s] on Alist.", filepath.Join(alistpath, alistfile))
+				}
+			}(alistdir, alistfiles)
+		}
+
+		wg.Wait()
+
+		for fpath := range fdirMap {
+			rootDirMap[getRootDir(fpath, cfg.MediaDir)]++
 			validDirs++
 		}
 	}
@@ -372,16 +402,13 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 		}
 
 		s := strings.ReplaceAll(string(bytes.TrimSpace(p)), "%20", " ")
-		u, err := url.Parse(s)
-		if err == nil {
-			s = u.String()
-		}
 
 		if strings.HasPrefix(s, defaultAlistEndpoint) {
-			relUrl := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(u.Path, "/"), defaultAlistStrmRootPath), "/")
+			relpath := "/" + strings.TrimPrefix(strings.TrimPrefix(s, defaultAlistEndpoint), "/")
+			relUrl := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(relpath, "/"), defaultAlistStrmRootPath), "/")
 			relUrl = "/" + strings.TrimPrefix(cfg.AlistStrmRootPath, "/") + "/" + strings.TrimPrefix(relUrl, "/")
 
-			u.Scheme, u.Opaque, u.User, u.Host, u.Path = o.Scheme, o.Opaque, o.User, o.Host, relUrl
+			u := &url.URL{Scheme: o.Scheme, Opaque: o.Opaque, User: o.User, Host: o.Host, Path: relUrl}
 			s = u.String()
 		}
 
@@ -516,6 +543,10 @@ func copyFile(tx *sql.Tx, file *MetadataFile, to, from string) error {
 		return err
 	}
 	defer stmt.Close()
+
+	if err := os.MkdirAll(filepath.Dir(to), dirPerm); err != nil {
+		return err
+	}
 
 	toFile, err := os.Create(to)
 	if err != nil {
