@@ -27,16 +27,17 @@ const (
 )
 
 type Config struct {
-	RunMode           int
-	RunAsDaemon       bool
-	RunCron           string
-	MediaDir          string
-	DownloadDir       string
-	Purge             bool
-	Help              bool
-	MirrorURL         []string
-	AlistURL          string
-	AlistStrmRootPath string
+	RunMode            int
+	RunAsDaemon        bool
+	RunCron            string
+	MediaDir           string
+	DownloadDir        string
+	Purge              bool
+	Help               bool
+	MirrorURL          []string
+	AlistURL           string
+	AlistStrmRootPath  string
+	StrmPathSkipVerify []string
 
 	alistClient *AlistClient
 }
@@ -193,7 +194,7 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 	)
 	rootDirMap := make(map[string]int)
 	strmToSkip := make(map[string]bool)
-	pathToScan := make(map[string]map[string]string)
+	alistToScan := make(map[string]map[string]string)
 	workerChan := make(chan struct{}, defaultWorkers())
 
 	for path, strmsMap := range strmMap {
@@ -202,8 +203,16 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 			validDirs++
 		}
 
+	LOOP:
 		for strm := range strmsMap {
 			fpath := filepath.Join(path, strm)
+
+			for _, toSkip := range cfg.StrmPathSkipVerify {
+				if strings.HasPrefix(fpath, toSkip) {
+					continue LOOP
+				}
+			}
+
 			p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -223,19 +232,19 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 
 				alistdir := filepath.Dir(relUrl)
 				alistfile := filepath.Base(relUrl)
-				alistfiles := pathToScan[alistdir]
+				alistfiles := alistToScan[alistdir]
 				if alistfiles == nil {
 					alistfiles = make(map[string]string)
 				}
 				alistfiles[alistfile] = fpath
-				pathToScan[alistdir] = alistfiles
+				alistToScan[alistdir] = alistfiles
 			}
 		}
 	}
 
 	if cfg.Purge {
 		fdirMap := make(map[string]int)
-		for alistdir, alistfiles := range pathToScan {
+		for alistdir, alistfiles := range alistToScan {
 			wg.Add(1)
 			go func(alistpath string, alistfiles map[string]string) {
 				defer wg.Done()
@@ -511,6 +520,7 @@ func (cfg *Config) Command() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&cfg.MirrorURL, "mirror-url", "m", nil, "Specify the mirror URL to sync metadata from")
 	cmd.Flags().StringVarP(&cfg.AlistURL, "alist-url", "u", defaultAlistEndpoint, "Endpoint of xiaoya Alist. Change this value will result to url overide in strm file")
 	cmd.Flags().StringVarP(&cfg.AlistStrmRootPath, "alist-strm-root-path", "r", defaultAlistStrmRootPath, "Root path of strm files in xiaoya Alist")
+	cmd.Flags().StringSliceVar(&cfg.StrmPathSkipVerify, "strm-path-skip-verify", nil, "Specify the metadata path to skip verify strm files. For example: \"/115\"")
 	return cmd
 }
 
@@ -530,6 +540,19 @@ func (cfg *Config) Validate() (int, error) {
 		return 2, fmt.Errorf("invalid cron expression: %s", cfg.RunCron)
 	}
 
+	if len(cfg.StrmPathSkipVerify) > 0 {
+		var ss []string
+		for _, each := range cfg.StrmPathSkipVerify {
+			each = strings.TrimSpace(each)
+			if each == "/" || each == "" {
+				continue
+			}
+			each = "/" + strings.TrimPrefix(each, "/")
+			each = strings.TrimSuffix(each, "/") + "/"
+			ss = append(ss, each)
+		}
+		cfg.StrmPathSkipVerify = ss
+	}
 	return 0, nil
 }
 
