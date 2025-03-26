@@ -27,17 +27,18 @@ const (
 )
 
 type Config struct {
-	RunMode            int
-	RunAsDaemon        bool
-	RunCron            string
-	MediaDir           string
-	DownloadDir        string
-	Purge              bool
-	Help               bool
-	MirrorURL          []string
-	AlistURL           string
-	AlistStrmRootPath  string
-	StrmPathSkipVerify []string
+	RunMode             int
+	RunAsDaemon         bool
+	RunCron             string
+	MediaDir            string
+	DownloadDir         string
+	Purge               bool
+	Help                bool
+	MirrorURL           []string
+	AlistURL            string
+	AlistStrmRootPath   string
+	AlistPathSkipVerify []string
+	StrmPathSkipVerify  []string
 
 	alistClient *AlistClient
 }
@@ -228,6 +229,12 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 				u, err := url.ParseRequestURI(relUrl)
 				if err == nil {
 					relUrl = u.Path
+				}
+
+				for _, toSkip := range cfg.AlistPathSkipVerify {
+					if strings.HasPrefix(relUrl, toSkip) {
+						continue LOOP
+					}
 				}
 
 				alistdir := filepath.Dir(relUrl)
@@ -520,6 +527,7 @@ func (cfg *Config) Command() *cobra.Command {
 	cmd.Flags().StringSliceVarP(&cfg.MirrorURL, "mirror-url", "m", nil, "Specify the mirror URL to sync metadata from")
 	cmd.Flags().StringVarP(&cfg.AlistURL, "alist-url", "u", defaultAlistEndpoint, "Endpoint of xiaoya Alist. Change this value will result to url overide in strm file")
 	cmd.Flags().StringVarP(&cfg.AlistStrmRootPath, "alist-strm-root-path", "r", defaultAlistStrmRootPath, "Root path of strm files in xiaoya Alist")
+	cmd.Flags().StringSliceVar(&cfg.AlistPathSkipVerify, "alist-path-skip-verify", nil, "Specify the Alist path to skip verify files. For example: \"/🏷️我的115分享\"")
 	cmd.Flags().StringSliceVar(&cfg.StrmPathSkipVerify, "strm-path-skip-verify", nil, "Specify the metadata path to skip verify strm files. For example: \"/115\"")
 	return cmd
 }
@@ -540,6 +548,19 @@ func (cfg *Config) Validate() (int, error) {
 		return 2, fmt.Errorf("invalid cron expression: %s", cfg.RunCron)
 	}
 
+	if len(cfg.AlistPathSkipVerify) > 0 {
+		var ss []string
+		for _, each := range cfg.AlistPathSkipVerify {
+			each = strings.TrimSpace(each)
+			if each == "/" || each == "" {
+				continue
+			}
+			each = "/" + strings.TrimPrefix(each, "/")
+			each = strings.TrimSuffix(each, "/") + "/"
+			ss = append(ss, each)
+		}
+		cfg.AlistPathSkipVerify = ss
+	}
 	if len(cfg.StrmPathSkipVerify) > 0 {
 		var ss []string
 		for _, each := range cfg.StrmPathSkipVerify {
