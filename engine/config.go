@@ -216,6 +216,10 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 			if strings.HasPrefix(s, defaultAlistEndpoint) {
 				relpath := "/" + strings.TrimPrefix(strings.TrimPrefix(s, defaultAlistEndpoint), "/")
 				relUrl := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(relpath, "/"), defaultAlistStrmRootPath), "/")
+				u, err := url.ParseRequestURI(relUrl)
+				if err == nil {
+					relUrl = u.Path
+				}
 
 				alistdir := filepath.Dir(relUrl)
 				alistfile := filepath.Base(relUrl)
@@ -407,9 +411,13 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 			relpath := "/" + strings.TrimPrefix(strings.TrimPrefix(s, defaultAlistEndpoint), "/")
 			relUrl := "/" + strings.TrimPrefix(strings.TrimPrefix("/"+strings.TrimPrefix(relpath, "/"), defaultAlistStrmRootPath), "/")
 			relUrl = "/" + strings.TrimPrefix(cfg.AlistStrmRootPath, "/") + "/" + strings.TrimPrefix(relUrl, "/")
+			u, err := url.ParseRequestURI(relUrl)
+			if err == nil {
+				relUrl = u.Path
+			}
 
-			u := &url.URL{Scheme: o.Scheme, Opaque: o.Opaque, User: o.User, Host: o.Host, Path: relUrl}
-			s = u.String()
+			uu := &url.URL{Scheme: o.Scheme, Opaque: o.Opaque, User: o.User, Host: o.Host, Path: relUrl}
+			s = uu.String()
 		}
 
 		target := filepath.Join(cfg.MediaDir, strm)
