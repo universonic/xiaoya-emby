@@ -23,6 +23,7 @@ Usage:
 Flags:
   -r, --alist-strm-root-path string   Root path of strm files in xiaoya Alist (default "/d")
   -u, --alist-url string              Endpoint of xiaoya Alist. Change this value will result to url overide in strm file (default "http://xiaoya.host:5678")
+      --cron-expr string              Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
       --daemon                        Run as daemon in foreground (default true)
   -D, --download-dir string           Media directory of Emby to download metadata to (default "/download")
   -h, --help                          Print this message
@@ -30,7 +31,7 @@ Flags:
   -m, --mirror-url strings            Specify the mirror URL to sync metadata from
       --mode int                      Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata) (default 7)
   -p, --purge                         Whether to purge useless file or directory when media is no longer available (default true)
-      --run-cron string               Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
+  -v, --version                       Print software version
 ```
 
 ### Kickstart
