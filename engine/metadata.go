@@ -74,7 +74,7 @@ type MetadataCrawler struct {
 	selectedPaths     []string
 	ignoredDirs       []string // TODO:
 	ignoredExtentions []string // TODO:
-	purge             bool
+	cleanup           bool
 }
 
 type sortMirror struct {
@@ -82,14 +82,14 @@ type sortMirror struct {
 	duration time.Duration
 }
 
-func NewMetadataCrawler(downloadDir string, mirrors, selectedPaths, ignoredDirs, ignoredExtentions []string, purge bool) (*MetadataCrawler, error) {
+func NewMetadataCrawler(downloadDir string, mirrors, selectedPaths, ignoredDirs, ignoredExtentions []string, cleanup bool) (*MetadataCrawler, error) {
 	mc := &MetadataCrawler{
 		client:            &http.Client{Timeout: 60 * time.Second},
 		downloadDir:       downloadDir,
 		selectedPaths:     selectedPaths,
 		ignoredDirs:       ignoredDirs,
 		ignoredExtentions: ignoredExtentions,
-		purge:             purge,
+		cleanup:           cleanup,
 	}
 
 	if len(mirrors) == 0 {
@@ -229,7 +229,11 @@ func (mc *MetadataCrawler) head(path, mirror string) (*MetadataFile, error) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			err = errors.New(resp.Status)
+			if resp.StatusCode == http.StatusNotFound {
+				err = fs.ErrNotExist
+			} else {
+				err = errors.New(resp.Status)
+			}
 			time.Sleep(time.Second * 3)
 			continue
 		}
@@ -307,7 +311,11 @@ func (mc *MetadataCrawler) get(path, mirror string) ([]*MetadataFile, error) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			err = errors.New(resp.Status)
+			if resp.StatusCode == http.StatusNotFound {
+				err = fs.ErrNotExist
+			} else {
+				err = errors.New(resp.Status)
+			}
 			time.Sleep(time.Second * 3)
 			continue
 		}
@@ -540,7 +548,6 @@ func (mc *MetadataCrawler) Sync() error {
 					path: path,
 					info: oldFile,
 				})
-				return
 			}
 		}(path, oldFile)
 
@@ -589,6 +596,11 @@ FINAL:
 
 				return oldFile == nil || newFile.ModTime().Sub(oldFile.ModTime()) > 0 && (newFile.Size() != oldFile.Size() || newFile.ETag() != oldFile.ETag())
 			}); err != nil {
+				if os.IsNotExist(err) {
+					log.Printf("[WARN] Skipped to download as it appears to no longer exist on the mirror server: %s", path)
+					return
+				}
+
 				mux.Lock()
 				defer mux.Unlock()
 
@@ -597,7 +609,6 @@ FINAL:
 					path: path,
 					info: oldFile,
 				})
-				return
 			}
 		}(each.path, each.info)
 	}
@@ -616,23 +627,23 @@ FINAL:
 		goto FINAL
 	}
 
-	// if mc.purge {
-	// 	for _, oldFile := range local {
-	// 		if file, ok := remoteMap[oldFile.Path()]; !ok {
-	// 			tx, err := db.Begin()
-	// 			if err != nil {
-	// 				return err
-	// 			}
+	if mc.cleanup {
+		for _, oldFile := range local {
+			if file, ok := remoteMap[oldFile.Path()]; !ok {
+				tx, err := db.Begin()
+				if err != nil {
+					return err
+				}
 
-	// 			if err := deleteFile(tx, oldFile); err != nil {
-	// 				tx.Rollback()
-	// 				continue
-	// 			}
-	// 			deleteDirIfEmpty(filepath.Dir(file.Path()))
-	// 			tx.Rollback()
-	// 		}
-	// 	}
-	// }
+				if err := deleteFile(tx, oldFile); err != nil {
+					tx.Rollback()
+					continue
+				}
+				deleteDirIfEmpty(filepath.Dir(file.Path()))
+				tx.Rollback()
+			}
+		}
+	}
 	return nil
 }
 
@@ -685,7 +696,11 @@ func (mc *MetadataCrawler) download(tx *sql.Tx, path, mirror string, filterFn fu
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			err = errors.New(resp.Status)
+			if resp.StatusCode == http.StatusNotFound {
+				err = fs.ErrNotExist
+			} else {
+				err = errors.New(resp.Status)
+			}
 			time.Sleep(time.Second * 3)
 			continue
 		}
