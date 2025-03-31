@@ -596,13 +596,14 @@ FINAL:
 
 				return oldFile == nil || newFile.ModTime().Sub(oldFile.ModTime()) > 0 && (newFile.Size() != oldFile.Size() || newFile.ETag() != oldFile.ETag())
 			}); err != nil {
-				if os.IsNotExist(err) {
-					log.Printf("[WARN] Skipped to download as it appears to no longer exist on the mirror server: %s", path)
-					return
-				}
-
 				mux.Lock()
 				defer mux.Unlock()
+
+				if os.IsNotExist(err) {
+					log.Printf("[WARN] Skipped to download as it appears to no longer exist on the mirror server: %s", path)
+					delete(remoteMap, path)
+					return
+				}
 
 				log.Printf("[ERROR] Failed to download: %s", path)
 				failed2 = append(failed2, failedEntry{
