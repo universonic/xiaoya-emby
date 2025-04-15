@@ -35,21 +35,22 @@ Usage:
   xiaoya-emby [flags]
 
 Flags:
-      --alist-path-skip-verify strings   Specify the Alist path to skip verify files. For example: "/🏷️我的115分享".
-  -r, --alist-strm-root-path string      Root path of strm files in xiaoya Alist. (default "/d")
-  -u, --alist-url string                 Endpoint of xiaoya Alist. Change this value will result to url overide in strm file. (default "http://xiaoya.host:5678")
-      --cleanup                          Cleanup downloaded metadata when file no longer exists on remote server.
-      --cron-expr string                 Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
-      --daemon                           Run as daemon in foreground. (default true)
-  -D, --download-dir string              Media directory of Emby to download metadata to. (default "/download")
-  -h, --help                             Print this message.
-  -d, --media-dir string                 Media directory of Emby to maintain metadata. (default "/media")
-  -m, --mirror-url strings               Specify the mirror URL to sync metadata from.
-      --mode int                         Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata) (default 7)
-  -p, --purge                            Whether to purge useless file or directory when media is no longer available. (default true)
-      --strm-path-skip-verify strings    Specify the metadata path to skip verify strm files. For example: "/115".
-  -v, --version                          Print software version.
-  -v, --version                          Print software version
+      --alist-path-skip-verify strings            Specify the Alist path to skip verify files. For example: "/🏷️我的115分享".
+      --alist-path-skip-verify-from-file string   A file contains a list of Alist path to skip verify.
+  -r, --alist-strm-root-path string               Root path of strm files in xiaoya Alist. (default "/d")
+  -u, --alist-url string                          Endpoint of xiaoya Alist. Change this value will result to url overide in strm file. (default "http://xiaoya.host:5678")
+      --cleanup                                   Cleanup downloaded metadata when file no longer exists on remote server.
+      --cron-expr string                          Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
+      --daemon                                    Run as daemon in foreground. (default true)
+  -D, --download-dir string                       Media directory of Emby to download metadata to. (default "/download")
+  -h, --help                                      Print this message.
+  -d, --media-dir string                          Media directory of Emby to maintain metadata. (default "/media")
+  -m, --mirror-url strings                        Specify the mirror URL to sync metadata from.
+      --mode int                                  Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata) (default 7)
+  -p, --purge                                     Whether to purge useless file or directory when media is no longer available. (default true)
+      --strm-path-skip-verify strings             Specify the metadata path to skip verify strm files. For example: "/115".
+      --strm-path-skip-verify-from-file string    A file contains a list of strm path to skip verify.
+  -v, --version                                   Print software version.
 ```
 
 ### Kickstart

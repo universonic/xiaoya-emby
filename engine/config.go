@@ -27,19 +27,21 @@ const (
 )
 
 type Config struct {
-	RunMode             int
-	RunAsDaemon         bool
-	RunCron             string
-	MediaDir            string
-	DownloadDir         string
-	Cleanup             bool
-	Purge               bool
-	Help                bool
-	MirrorURL           []string
-	AlistURL            string
-	AlistStrmRootPath   string
-	AlistPathSkipVerify []string
-	StrmPathSkipVerify  []string
+	RunMode                     int
+	RunAsDaemon                 bool
+	RunCron                     string
+	MediaDir                    string
+	DownloadDir                 string
+	Cleanup                     bool
+	Purge                       bool
+	Help                        bool
+	MirrorURL                   []string
+	AlistURL                    string
+	AlistStrmRootPath           string
+	AlistPathSkipVerify         []string
+	AlistPathSkipVerifyFromFile string
+	StrmPathSkipVerify          []string
+	StrmPathSkipVerifyFromFile  string
 
 	alistClient *AlistClient
 }
@@ -530,7 +532,9 @@ func (cfg *Config) Command() *cobra.Command {
 	cmd.Flags().StringVarP(&cfg.AlistURL, "alist-url", "u", defaultAlistEndpoint, "Endpoint of xiaoya Alist. Change this value will result to url overide in strm file.")
 	cmd.Flags().StringVarP(&cfg.AlistStrmRootPath, "alist-strm-root-path", "r", defaultAlistStrmRootPath, "Root path of strm files in xiaoya Alist.")
 	cmd.Flags().StringSliceVar(&cfg.AlistPathSkipVerify, "alist-path-skip-verify", nil, "Specify the Alist path to skip verify files. For example: \"/🏷️我的115分享\".")
+	cmd.Flags().StringVar(&cfg.AlistPathSkipVerifyFromFile, "alist-path-skip-verify-from-file", "", "A file contains a list of Alist path to skip verify.")
 	cmd.Flags().StringSliceVar(&cfg.StrmPathSkipVerify, "strm-path-skip-verify", nil, "Specify the metadata path to skip verify strm files. For example: \"/115\".")
+	cmd.Flags().StringVar(&cfg.StrmPathSkipVerifyFromFile, "strm-path-skip-verify-from-file", "", "A file contains a list of strm path to skip verify.")
 	return cmd
 }
 
@@ -550,6 +554,19 @@ func (cfg *Config) Validate() (int, error) {
 		return 2, fmt.Errorf("invalid cron expression: %s", cfg.RunCron)
 	}
 
+	if cfg.AlistPathSkipVerifyFromFile != "" {
+		p, err := os.ReadFile(cfg.AlistPathSkipVerifyFromFile)
+		if err != nil {
+			return 2, fmt.Errorf("AlistPathSkipVerifyFromFile is invalid: %v", err)
+		}
+		ss := strings.SplitN(string(bytes.TrimSpace(p)), "\n", -1)
+		for _, each := range ss {
+			if each == "" {
+				continue
+			}
+			cfg.AlistPathSkipVerify = append(cfg.AlistPathSkipVerify, strings.TrimSpace(each))
+		}
+	}
 	if len(cfg.AlistPathSkipVerify) > 0 {
 		var ss []string
 		for _, each := range cfg.AlistPathSkipVerify {
@@ -562,6 +579,19 @@ func (cfg *Config) Validate() (int, error) {
 			ss = append(ss, each)
 		}
 		cfg.AlistPathSkipVerify = ss
+	}
+	if cfg.StrmPathSkipVerifyFromFile != "" {
+		p, err := os.ReadFile(cfg.StrmPathSkipVerifyFromFile)
+		if err != nil {
+			return 2, fmt.Errorf("StrmPathSkipVerifyFromFile is invalid: %v", err)
+		}
+		ss := strings.SplitN(string(bytes.TrimSpace(p)), "\n", -1)
+		for _, each := range ss {
+			if each == "" {
+				continue
+			}
+			cfg.StrmPathSkipVerify = append(cfg.StrmPathSkipVerify, strings.TrimSpace(each))
+		}
 	}
 	if len(cfg.StrmPathSkipVerify) > 0 {
 		var ss []string
