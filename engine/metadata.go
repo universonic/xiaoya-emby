@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -45,22 +45,22 @@ var (
 		"/音乐",
 	}
 	sMirrors = []string{
-        	"https://emby.xiaoya.pro/",
-        	"https://icyou.eu.org/",
-        	"https://emby.8.net.co/",
-        	"https://emby.raydoom.tk/",
-        	"https://emby.kaiserver.uk/",
-        	"https://embyxiaoya.laogl.top/",
-        	"https://emby-data.poxi1221.eu.org/",
-        	"https://emby-data.ermaokj.cn/",
-        	"https://emby-data.bdbd.fun/",
-        	"https://emby-data.wwwh.eu.org/",
-        	"https://emby-data.f1rst.top/",
-        	"https://emby-data.ymschh.top/",
-        	"https://emby-data.wx1.us.kg/",
-        	"https://emby-data.r2s.site/",
-        	"https://emby-data.neversay.eu.org/",
-        	"https://emby-data.800686.xyz/",
+		"https://emby.xiaoya.pro/",
+		"https://icyou.eu.org/",
+		"https://emby.8.net.co/",
+		"https://emby.raydoom.tk/",
+		"https://emby.kaiserver.uk/",
+		"https://embyxiaoya.laogl.top/",
+		"https://emby-data.poxi1221.eu.org/",
+		"https://emby-data.ermaokj.cn/",
+		"https://emby-data.bdbd.fun/",
+		"https://emby-data.wwwh.eu.org/",
+		"https://emby-data.f1rst.top/",
+		"https://emby-data.ymschh.top/",
+		"https://emby-data.wx1.us.kg/",
+		"https://emby-data.r2s.site/",
+		"https://emby-data.neversay.eu.org/",
+		"https://emby-data.800686.xyz/",
 	}
 	sFolder = []string{".sync"}
 	sExt    = []string{".ass", ".srt", ".ssa"}
@@ -85,7 +85,7 @@ type sortMirror struct {
 
 func NewMetadataCrawler(downloadDir string, mirrors, selectedPaths, ignoredDirs, ignoredExtentions []string, cleanup bool) (*MetadataCrawler, error) {
 	mc := &MetadataCrawler{
-		client:            &http.Client{Timeout: 60 * time.Second},
+		client:            newBrowserClient(60 * time.Second),
 		downloadDir:       downloadDir,
 		selectedPaths:     selectedPaths,
 		ignoredDirs:       ignoredDirs,
@@ -142,7 +142,7 @@ LOOP:
 		select {
 		case <-ticker.C:
 			if err := mc.validateMirrors(); err != nil {
-				log.Printf("[ERROR] Failed to validate mirrors: %v", err)
+				slog.Error("Failed to validate mirrors", "error", err)
 			}
 		case <-ctx.Done():
 			break LOOP
@@ -152,7 +152,7 @@ LOOP:
 
 func (mc *MetadataCrawler) validateMirrors() error {
 	var mirrorsToSort []sortMirror
-	log.Println("[INFO] Validating metadata mirrors...")
+	slog.Info("Validating metadata mirrors...")
 	for _, mirror := range mc.mirrors {
 		dur := []time.Duration{}
 		for i := 0; i < 5; i++ {
@@ -161,7 +161,7 @@ func (mc *MetadataCrawler) validateMirrors() error {
 			}
 		}
 		if len(dur) < 4 {
-			log.Printf("[WARN] Invalid metadata mirror: %s", mirror)
+			slog.Warn("Invalid metadata mirror", "mirror", mirror)
 			continue
 		}
 		sum := time.Duration(0)
@@ -173,7 +173,7 @@ func (mc *MetadataCrawler) validateMirrors() error {
 			duration: sum / time.Duration(len(dur)),
 		}
 		mirrorsToSort = append(mirrorsToSort, m)
-		log.Printf("[INFO] Validated metadata mirror: %s (%dms)", mirror, m.duration/time.Millisecond)
+		slog.Info("Validated metadata mirror", "mirror", mirror, "latency_ms", m.duration/time.Millisecond)
 	}
 	sort.Slice(mirrorsToSort, func(i, j int) bool { return mirrorsToSort[i].duration < mirrorsToSort[j].duration })
 
@@ -210,7 +210,7 @@ func (mc *MetadataCrawler) head(path, mirror string) (*MetadataFile, error) {
 	if err != nil {
 		return nil, &fs.PathError{Op: "Head", Path: path, Err: err}
 	}
-	req.Header.Set("User-Agent", GlobalUserAgent)
+	setFetchHeaders(req.Header)
 
 	var resp *http.Response
 	for range 3 {
@@ -292,7 +292,7 @@ func (mc *MetadataCrawler) get(path, mirror string) ([]*MetadataFile, error) {
 	if err != nil {
 		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
 	}
-	req.Header.Set("User-Agent", GlobalUserAgent)
+	setNavigationHeaders(req.Header)
 
 	var resp *http.Response
 	for range 3 {
@@ -485,14 +485,14 @@ func (mc *MetadataCrawler) Sync() error {
 
 	if err := mc.Walk("/", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			log.Printf("[ERROR] Error validating metadata file: %v", err)
+			slog.Error("Error validating metadata file", "path", path, "error", err)
 			return err
 		}
 		if info.IsDir() {
 			ss := strings.Split(strings.TrimPrefix(path, "/"), "/")
 			rootpath := ss[0]
 			if path != "/" && !selectedRoot[rootpath] {
-				log.Printf("[INFO] Skipped Directory: %s", path)
+				slog.Info("Skipped directory", "path", path)
 				return filepath.SkipDir
 			}
 			return nil
@@ -507,7 +507,7 @@ func (mc *MetadataCrawler) Sync() error {
 			fp := filepath.Join(mc.downloadDir, strings.TrimLeft(oldFile.Path(), "/"))
 			_, err = os.Stat(fp)
 			if err != nil {
-				log.Printf("[WARN] Missing file: %s", oldFile.Path())
+				slog.Warn("Missing file", "path", oldFile.Path())
 				oldFile = nil
 			}
 		}
@@ -528,7 +528,7 @@ func (mc *MetadataCrawler) Sync() error {
 					path: path,
 					info: oldFile,
 				})
-				log.Printf("[ERROR] Critical DB error: %v", err)
+				slog.Error("Critical DB error", "error", err)
 				return
 			}
 			defer tx.Rollback()
@@ -544,7 +544,7 @@ func (mc *MetadataCrawler) Sync() error {
 				mux.Lock()
 				defer mux.Unlock()
 
-				log.Printf("[ERROR] Failed to download: %s", path)
+				slog.Error("Failed to download", "path", path, "error", err)
 				failed = append(failed, failedEntry{
 					path: path,
 					info: oldFile,
@@ -554,7 +554,7 @@ func (mc *MetadataCrawler) Sync() error {
 
 		return nil
 	}); err != nil {
-		log.Printf("[ERROR] Critical error: %v", err)
+		slog.Error("Critical error", "error", err)
 
 		wg.Wait()
 		return err
@@ -584,7 +584,7 @@ FINAL:
 					path: path,
 					info: oldFile,
 				})
-				log.Printf("[ERROR] Critical DB error: %v", err)
+				slog.Error("Critical DB error", "error", err)
 				return
 			}
 			defer tx.Rollback()
@@ -600,13 +600,13 @@ FINAL:
 				mux.Lock()
 				defer mux.Unlock()
 
-				if os.IsNotExist(err) {
-					log.Printf("[WARN] Skipped to download as it appears to no longer exist on the mirror server: %s", path)
+				if errors.Is(err, fs.ErrNotExist) {
+					slog.Warn("Skipped to download as it appears to no longer exist on the mirror server", "path", path)
 					delete(remoteMap, path)
 					return
 				}
 
-				log.Printf("[ERROR] Failed to download: %s", path)
+				slog.Error("Failed to download", "path", path, "error", err)
 				failed2 = append(failed2, failedEntry{
 					path: path,
 					info: oldFile,
@@ -618,14 +618,14 @@ FINAL:
 	wg.Wait()
 	if len(failed2) > 0 {
 		if retry > 5 {
-			log.Println("[ERROR] Metadata download has exceeded the maximum retry attempts.")
+			slog.Error("Metadata download has exceeded the maximum retry attempts.")
 			return fmt.Errorf("maximum retry attempts exceeded")
 		}
 		failed = make([]failedEntry, len(failed2))
 		copy(failed, failed2)
 		failed2 = failed2[:0]
 		retry++
-		log.Println("[INFO] Failed metadata entries will be retried...")
+		slog.Info("Failed metadata entries will be retried...")
 		goto FINAL
 	}
 
@@ -677,13 +677,13 @@ func (mc *MetadataCrawler) download(tx *sql.Tx, path, mirror string, filterFn fu
 	if err != nil {
 		return &fs.PathError{Op: "Get", Path: path, Err: err}
 	}
-	req.Header.Set("User-Agent", GlobalUserAgent)
+	setNavigationHeaders(req.Header)
 
 	var resp *http.Response
 	for range 3 {
 		resp, err = mc.client.Do(req)
 		if err != nil {
-			log.Printf("[WARN] Error downloading [%s] %s: %v", mirror, path, err)
+			slog.Warn("Error downloading", "mirror", mirror, "path", path, "error", err)
 			if err, ok := err.(*url.Error); ok {
 				err := err.Err
 				_, ok := err.(*net.OpError)
@@ -733,43 +733,61 @@ func (mc *MetadataCrawler) download(tx *sql.Tx, path, mirror string, filterFn fu
 	}
 
 	if filterFn == nil || filterFn(f) {
-		log.Printf("[INFO] Downloading [%s]: %s", mirror, path)
+		slog.Info("Downloading", "mirror", mirror, "path", path)
 		filePath := filepath.Join(mc.downloadDir, strings.TrimLeft(f.Path(), "/"))
 		if err := os.MkdirAll(filepath.Dir(filePath), dirPerm); err != nil {
-			return &fs.PathError{Op: "Get", Path: f.Path(), Err: err}
+			return &fsError{err}
 		}
 
 		out, err := os.Create(filePath)
 		if err != nil {
-			return &fs.PathError{Op: "Get", Path: f.Path(), Err: err}
+			return &fsError{err}
 		}
 		defer out.Close()
 
 		f.etag = resp.Header.Get("ETag")
 
 		if _, err := io.Copy(out, resp.Body); err != nil {
+			var perr *fs.PathError
+			if errors.As(err, &perr) && perr.Path == filePath {
+				return &fsError{err}
+			}
 			return &fs.PathError{Op: "Get", Path: f.Path(), Err: err}
 		}
 
 		if err = updateToDB(tx, f); err != nil {
 			return &fs.PathError{Op: "Get", Path: f.Path(), Err: err}
 		}
-		log.Printf("[INFO] Downloaded: %s", path)
+		slog.Info("Downloaded", "path", path)
 		return nil
 	}
 
-	log.Printf("[INFO] Skipped: %s", f.Path())
+	slog.Info("Skipped", "path", f.Path())
 	return nil
 }
+
+// fsError marks a local filesystem failure (as opposed to a mirror/network
+// failure), so that Download skips retrying the remaining mirrors.
+type fsError struct{ err error }
+
+func (e *fsError) Error() string { return e.err.Error() }
+func (e *fsError) Unwrap() error { return e.err }
 
 func (mc *MetadataCrawler) Download(tx *sql.Tx, path string, filterFn func(f *MetadataFile) bool) (err error) {
 	activeMirrors := mc.activeMirrors()
 	for i := range activeMirrors {
 		mirror := activeMirrors[i]
 		err = mc.download(tx, path, mirror, filterFn)
-		if err != nil && i < len(activeMirrors)-1 {
-			log.Printf("[WARN] Failed to download %s from mirror %s. It will be try again.", path, mirror)
-			continue
+		if err != nil {
+			var ferr *fsError
+			if errors.As(err, &ferr) {
+				slog.Error("Local filesystem error while downloading, skipping mirror retry", "path", path, "error", err)
+				return
+			}
+			if i < len(activeMirrors)-1 {
+				slog.Warn("Failed to download, will try next mirror", "path", path, "mirror", mirror, "error", err)
+				continue
+			}
 		}
 		break
 	}
@@ -852,9 +870,9 @@ func validateMirror(url string) time.Duration {
 	if err != nil {
 		return 0
 	}
-	req.Header.Set("User-Agent", GlobalUserAgent)
+	setNavigationHeaders(req.Header)
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := newBrowserClient(3 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0

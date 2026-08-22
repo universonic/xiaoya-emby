@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	GlobalUserAgent          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
 	defaultAlistEndpoint     = "http://xiaoya.host:5678"
 	defaultAlistStrmRootPath = "/d"
 )
@@ -30,6 +29,7 @@ type Config struct {
 	RunMode                     int
 	RunAsDaemon                 bool
 	RunCron                     string
+	LogLevel                    string
 	MediaDir                    string
 	DownloadDir                 string
 	Cleanup                     bool
@@ -57,7 +57,7 @@ func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
 	)
 
 	if cfg.RunAsDaemon {
-		log.Println("[INFO] Run as daemon in foreground...")
+		slog.Info("Run as daemon in foreground...")
 	}
 
 METADATA:
@@ -65,7 +65,7 @@ METADATA:
 		remote, err = cfg.downloadMetadata()
 		if err != nil {
 			if cfg.RunAsDaemon {
-				log.Printf("[ERROR] Critical error: %v", err)
+				slog.Error("Critical error", "error", err)
 				time.Sleep(time.Second * 5)
 				goto METADATA
 			}
@@ -73,13 +73,13 @@ METADATA:
 			errCh <- err
 			return
 		}
-		log.Println("[INFO] Finished metadata download.")
+		slog.Info("Finished metadata download.")
 	} else {
 		crawler := &MetadataCrawler{downloadDir: cfg.DownloadDir}
 		remote, err = crawler.LocalFiles()
 		if err != nil {
 			if cfg.RunAsDaemon {
-				log.Printf("[ERROR] Critical error: %v", err)
+				slog.Error("Critical error", "error", err)
 				time.Sleep(time.Second * 5)
 				goto METADATA
 			}
@@ -87,7 +87,7 @@ METADATA:
 			errCh <- err
 			return
 		}
-		log.Println("[INFO] Skipped metadata download.")
+		slog.Info("Skipped metadata download.")
 	}
 
 	if cfg.RunMode&1 != 1 {
@@ -100,7 +100,7 @@ COMPARE:
 	filesToPreserve, err := cfg.compareMetadata(remote)
 	if err != nil {
 		if cfg.RunAsDaemon {
-			log.Printf("[ERROR] Critical error: %v", err)
+			slog.Error("Critical error", "error", err)
 			time.Sleep(time.Second * 5)
 			goto COMPARE
 		}
@@ -108,13 +108,13 @@ COMPARE:
 		errCh <- err
 		return
 	}
-	log.Printf("[INFO] %d metadata files to sync.", len(filesToPreserve))
+	slog.Info("Metadata files to sync", "count", len(filesToPreserve))
 
 PREPARE:
 	filesNeedUpdate, err := cfg.prepareMetadataUpdate(filesToPreserve)
 	if err != nil {
 		if cfg.RunAsDaemon {
-			log.Printf("[ERROR] Critical error: %v", err)
+			slog.Error("Critical error", "error", err)
 			time.Sleep(time.Second * 5)
 			goto PREPARE
 		}
@@ -122,13 +122,13 @@ PREPARE:
 		errCh <- err
 		return
 	}
-	log.Printf("[INFO] %d files need to be updated.", len(filesNeedUpdate))
+	slog.Info("Files need to be updated", "count", len(filesNeedUpdate))
 
 SYNC:
 	err = cfg.syncMetadata(filesNeedUpdate)
 	if err != nil {
 		if cfg.RunAsDaemon {
-			log.Printf("[ERROR] Critical error: %v", err)
+			slog.Error("Critical error", "error", err)
 			time.Sleep(time.Second * 5)
 			goto SYNC
 		}
@@ -140,7 +140,7 @@ SYNC:
 		sche, _ := cron.ParseStandard(cfg.RunCron)
 		next := sche.Next(time.Now())
 		d := time.Until(next)
-		log.Printf("[INFO] Next task will be started at: %s. Waiting for %v...", next.Format(time.RFC3339), d)
+		slog.Info("Next task will be started", "at", next.Format(time.RFC3339), "wait", d)
 		time.Sleep(d)
 		goto METADATA
 	}
@@ -149,7 +149,7 @@ SYNC:
 }
 
 func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
-	log.Println("[INFO] Start metadata download...")
+	slog.Info("Start metadata download...")
 	crawler, err := NewMetadataCrawler(cfg.DownloadDir, cfg.MirrorURL, nil, nil, nil, cfg.Cleanup)
 	if err != nil {
 		return nil, err
@@ -272,11 +272,11 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 					}
 
 					if os.IsNotExist(err) {
-						log.Printf("[WARN] Absent stream folder [%s] on Alist.", alistpath)
+						slog.Warn("Absent stream folder on Alist", "path", alistpath)
 						return
 					}
 
-					log.Printf("[ERROR] Cannot verify stream folder [%s] on Alist: %v", alistpath, err)
+					slog.Error("Cannot verify stream folder on Alist", "path", alistpath, "error", err)
 					return
 				}
 
@@ -295,7 +295,7 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 						continue
 					}
 					strmToSkip[fpath] = true
-					log.Printf("[WARN] Absent stream [%s] on Alist.", filepath.Join(alistpath, alistfile))
+					slog.Warn("Absent stream on Alist", "path", filepath.Join(alistpath, alistfile))
 				}
 			}(alistdir, alistfiles)
 		}
@@ -322,9 +322,9 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 
 	p, err := json.MarshalIndent(rootDirMap, "", "  ")
 	if err == nil {
-		log.Printf("[INFO] Valid metadata directories =>\n%s\n", p)
+		slog.Info("Valid metadata directories", "dirs", string(p))
 	}
-	log.Printf("[INFO] %d/%d valid metadata directories in total.\n", validDirs, len(strmMap))
+	slog.Info("Valid metadata directories in total", "valid", validDirs, "total", len(strmMap))
 	return filesToPreserve, nil
 }
 
@@ -405,7 +405,7 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 		}
 	}
 
-	log.Println("[INFO] Finalizing updates...")
+	slog.Info("Finalizing updates...")
 
 	o, err := url.Parse(cfg.AlistURL)
 	if err != nil {
@@ -486,7 +486,7 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 		}
 		tx.Rollback()
 	}
-	log.Println("[INFO] Done.")
+	slog.Info("Done.")
 	return nil
 }
 
@@ -497,6 +497,11 @@ func (cfg *Config) Command() *cobra.Command {
 		Long:    `Utility to maintain metadata files in xiaoya media library for Emby`,
 		Version: Version,
 		Run: func(cmd *cobra.Command, args []string) {
+			if err := SetLogLevel(cfg.LogLevel); err != nil {
+				fmt.Fprintln(os.Stdout, err)
+				os.Exit(2)
+			}
+
 			ecode, err := cfg.Validate()
 			if err != nil {
 				fmt.Fprintln(os.Stdout, err)
@@ -522,6 +527,7 @@ func (cfg *Config) Command() *cobra.Command {
 	cmd.Flags().IntVar(&cfg.RunMode, "mode", 7, "Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata)")
 	cmd.Flags().BoolVar(&cfg.RunAsDaemon, "daemon", true, "Run as daemon in foreground.")
 	cmd.Flags().StringVar(&cfg.RunCron, "cron-expr", "0 0 * * *", "Cron expression as scheduled task. Must run as daemon.")
+	cmd.Flags().StringVarP(&cfg.LogLevel, "log-level", "l", defaultLogLevel(), "Minimum log level (debug, info, warn, error). Env: LOG_LEVEL.")
 	cmd.Flags().StringVarP(&cfg.MediaDir, "media-dir", "d", "/media", "Media directory of Emby to maintain metadata.")
 	cmd.Flags().StringVarP(&cfg.DownloadDir, "download-dir", "D", "/download", "Media directory of Emby to download metadata to.")
 	cmd.Flags().BoolVar(&cfg.Cleanup, "cleanup", false, "Cleanup downloaded metadata when file no longer exists on remote server.")

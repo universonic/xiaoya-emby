@@ -44,6 +44,7 @@ Flags:
       --daemon                                    Run as daemon in foreground. (default true)
   -D, --download-dir string                       Media directory of Emby to download metadata to. (default "/download")
   -h, --help                                      Print this message.
+  -l, --log-level string                          Minimum log level (debug, info, warn, error). Env: LOG_LEVEL. (default "info")
   -d, --media-dir string                          Media directory of Emby to maintain metadata. (default "/media")
   -m, --mirror-url strings                        Specify the mirror URL to sync metadata from.
       --mode int                                  Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata) (default 7)

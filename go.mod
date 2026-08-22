@@ -4,6 +4,8 @@ go 1.25.1
 
 require (
 	github.com/PuerkitoBio/goquery v1.10.3
+	github.com/andybalholm/brotli v1.2.2
+	github.com/klauspost/compress v1.19.2
 	github.com/mattn/go-sqlite3 v1.14.32
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.1
