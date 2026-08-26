@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,11 +31,14 @@ type Config struct {
 	RunAsDaemon                 bool
 	RunCron                     string
 	LogLevel                    string
+	ListenAddr                  string
 	MediaDir                    string
 	DownloadDir                 string
 	Cleanup                     bool
 	Purge                       bool
 	Help                        bool
+	ForceCrawl                  bool
+	DownloadWorkers             int
 	MirrorURL                   []string
 	AlistURL                    string
 	AlistStrmRootPath           string
@@ -51,6 +55,13 @@ func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
 		cfg.alistClient, _ = NewAlistClient(cfg.AlistURL)
 	}
 
+	if cfg.ListenAddr != "" {
+		installRingLogHandler()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		startStatusServer(ctx, cfg.ListenAddr)
+	}
+
 	var (
 		remote []*MetadataFile
 		err    error
@@ -62,9 +73,16 @@ func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
 
 METADATA:
 	if cfg.RunMode&4 == 4 {
+		globalStatus.roundStart()
 		remote, err = cfg.downloadMetadata()
 		if err != nil {
+			globalStatus.roundEnd(err)
 			if cfg.RunAsDaemon {
+				if errors.Is(err, errManifestPending) {
+					slog.Warn("Manifest generation deferred until the next scheduled run", "error", err)
+					cfg.waitUntilNextRun()
+					goto METADATA
+				}
 				slog.Error("Critical error", "error", err)
 				time.Sleep(time.Second * 5)
 				goto METADATA
@@ -72,6 +90,9 @@ METADATA:
 			ecodeCh <- 2
 			errCh <- err
 			return
+		}
+		if cfg.RunMode&1 != 1 {
+			globalStatus.roundEnd(nil)
 		}
 		slog.Info("Finished metadata download.")
 	} else {
@@ -91,14 +112,17 @@ METADATA:
 	}
 
 	if cfg.RunMode&1 != 1 {
+		globalStatus.setPhase(PhaseIdle)
 		ecodeCh <- 0
 		errCh <- nil
 		return
 	}
 
 COMPARE:
+	globalStatus.setPhase(PhaseComparing)
 	filesToPreserve, err := cfg.compareMetadata(remote)
 	if err != nil {
+		globalStatus.roundEnd(err)
 		if cfg.RunAsDaemon {
 			slog.Error("Critical error", "error", err)
 			time.Sleep(time.Second * 5)
@@ -111,8 +135,10 @@ COMPARE:
 	slog.Info("Metadata files to sync", "count", len(filesToPreserve))
 
 PREPARE:
+	globalStatus.setPhase(PhasePreparing)
 	filesNeedUpdate, err := cfg.prepareMetadataUpdate(filesToPreserve)
 	if err != nil {
+		globalStatus.roundEnd(err)
 		if cfg.RunAsDaemon {
 			slog.Error("Critical error", "error", err)
 			time.Sleep(time.Second * 5)
@@ -125,8 +151,10 @@ PREPARE:
 	slog.Info("Files need to be updated", "count", len(filesNeedUpdate))
 
 SYNC:
+	globalStatus.setPhase(PhaseCopying)
 	err = cfg.syncMetadata(filesNeedUpdate)
 	if err != nil {
+		globalStatus.roundEnd(err)
 		if cfg.RunAsDaemon {
 			slog.Error("Critical error", "error", err)
 			time.Sleep(time.Second * 5)
@@ -134,23 +162,37 @@ SYNC:
 		}
 		ecodeCh <- 128
 		errCh <- err
+		return
 	}
+	// The media copy succeeded: it is now safe to commit the time base
+	// migration planned by prepareMetadataUpdate.
+	if ferr := finalizeMediaTimeBase(cfg.MediaDir); ferr != nil {
+		slog.Error("Failed to finalize media time base migration", "error", ferr)
+	}
+	globalStatus.roundEnd(nil)
 
 	if cfg.RunAsDaemon {
-		sche, _ := cron.ParseStandard(cfg.RunCron)
-		next := sche.Next(time.Now())
-		d := time.Until(next)
-		slog.Info("Next task will be started", "at", next.Format(time.RFC3339), "wait", d)
-		time.Sleep(d)
+		cfg.waitUntilNextRun()
 		goto METADATA
 	}
+	globalStatus.setPhase(PhaseIdle)
 	ecodeCh <- 0
 	errCh <- nil
 }
 
+func (cfg *Config) waitUntilNextRun() {
+	sche, _ := cron.ParseStandard(cfg.RunCron)
+	next := sche.Next(time.Now())
+	d := time.Until(next)
+	slog.Info("Next task will be started", "at", next.Format(time.RFC3339), "wait", d)
+	globalStatus.setNextRun(&next)
+	globalStatus.setPhase(PhaseSleeping)
+	time.Sleep(d)
+}
+
 func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
 	slog.Info("Start metadata download...")
-	crawler, err := NewMetadataCrawler(cfg.DownloadDir, cfg.MirrorURL, nil, nil, nil, cfg.Cleanup)
+	crawler, err := NewMetadataCrawler(cfg.DownloadDir, cfg.MirrorURL, nil, nil, nil, cfg.Cleanup, cfg.ForceCrawl, cfg.DownloadWorkers)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +209,11 @@ func (cfg *Config) downloadMetadata() ([]*MetadataFile, error) {
 }
 
 func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, error) {
+	downloadRoot, err := os.OpenRoot(cfg.DownloadDir)
+	if err != nil {
+		return nil, err
+	}
+	defer downloadRoot.Close()
 	strmMap := make(map[string]map[string]bool)
 	fullMap := make(map[string]map[string]bool)
 	for _, file := range files {
@@ -217,7 +264,7 @@ func (cfg *Config) compareMetadata(files []*MetadataFile) (map[string]bool, erro
 				}
 			}
 
-			p, err := os.ReadFile(filepath.Join(cfg.DownloadDir, fpath))
+			p, err := downloadRoot.ReadFile(rootRel(fpath))
 			if err != nil {
 				if os.IsNotExist(err) {
 					continue
@@ -333,13 +380,21 @@ func (cfg *Config) prepareMetadataUpdate(filesToPreserve map[string]bool) (map[s
 		return nil, err
 	}
 
-	localDB, err := sql.Open("sqlite3", filepath.Join(cfg.MediaDir, ".metadata.db"))
+	localDB, err := openMetadataDB(cfg.MediaDir)
 	if err != nil {
 		return nil, err
 	}
 	defer localDB.Close()
+	mediaRoot, err := os.OpenRoot(cfg.MediaDir)
+	if err != nil {
+		return nil, err
+	}
+	defer mediaRoot.Close()
 
 	if err := createFileTable(localDB); err != nil {
+		return nil, err
+	}
+	if err := createMetaTable(localDB); err != nil {
 		return nil, err
 	}
 
@@ -364,18 +419,53 @@ func (cfg *Config) prepareMetadataUpdate(filesToPreserve map[string]bool) (map[s
 			}
 			defer tx.Rollback()
 
-			deleteFile(tx, f)
-			deleteDirIfEmpty(filepath.Dir(f.Path()))
+			if err := deleteFile(tx, f, mediaRoot); err != nil {
+				// Keep the row so the deletion is retried next round; the
+				// combination of a missing file with a surviving row is
+				// repaired by the existence check below.
+				slog.Warn("Failed to delete stale media file record", "path", f.Path(), "error", err)
+				tx.Rollback()
+			}
 		}
 	}
 
-	remoteDB, err := sql.Open("sqlite3", filepath.Join(cfg.DownloadDir, ".metadata.db"))
+	remoteDB, err := openMetadataDB(cfg.DownloadDir)
 	if err != nil {
 		return nil, err
 	}
 	defer remoteDB.Close()
+	if err := createMetaTable(remoteDB); err != nil {
+		return nil, err
+	}
+
+	// The two databases may record timestamps on different time bases
+	// (manifest vs HTTP Last-Modified) when the download side switched
+	// modes since the media side last synced. Detect that once so the
+	// comparison below never orders timestamps across bases. A pending
+	// migration (planned but not yet copied) also counts as a mismatch so
+	// an interrupted copy is re-planned with the conservative rules.
+	localBase, err := getMeta(localDB, metaTimeBase)
+	if err != nil {
+		return nil, err
+	}
+	remoteBase, err := getMeta(remoteDB, metaTimeBase)
+	if err != nil {
+		return nil, err
+	}
+	pendingBase, err := getMeta(localDB, metaPendingTimeBase)
+	if err != nil {
+		return nil, err
+	}
+	if localBase == "" {
+		localBase = timeBaseHTTP
+	}
+	if remoteBase == "" {
+		remoteBase = timeBaseHTTP
+	}
+	baseMismatch := localBase != remoteBase || pendingBase != ""
 
 	filesNeedUpdate := make(map[string]bool)
+	var realign []manifestEntry
 	for path := range filesToPreserve {
 		remoteFile, err := pickFirstFile(remoteDB, path)
 		if err != nil {
@@ -386,11 +476,73 @@ func (cfg *Config) prepareMetadataUpdate(filesToPreserve map[string]bool) (map[s
 		}
 
 		localFile, ok := localMap[path]
-		if filepath.Ext(remoteFile.Name()) == ".strm" || !ok || (remoteFile.ModTime().Sub(localFile.ModTime()) > 0 && (remoteFile.Size() != localFile.Size() || remoteFile.ETag() != localFile.ETag())) {
+		if filepath.Ext(remoteFile.Name()) == ".strm" || !ok {
+			filesNeedUpdate[remoteFile.Path()] = true
+			continue
+		}
+		if _, err := mediaRoot.Stat(rootRel(path)); err != nil {
+			// The media file is gone but its database row survived (e.g.
+			// interrupted deletion or a lost volume): re-copy it.
+			slog.Warn("Media file missing, scheduling re-copy", "path", path)
+			filesNeedUpdate[remoteFile.Path()] = true
+			continue
+		}
+		if remoteFile.Size() == localFile.Size() && remoteFile.ETag() == localFile.ETag() {
+			// Identical content: never re-copy. Realign the stored
+			// timestamp when the delta is a pure timezone offset so
+			// future comparisons are on the same time base.
+			delta := remoteFile.ModTime().Unix() - localFile.ModTime().Unix()
+			if delta != 0 && nearHourOffset(delta) {
+				realign = append(realign, manifestEntry{path: remoteFile.Path(), ts: remoteFile.ModTime().Unix()})
+			}
+			continue
+		}
+		// Content differs: update whenever the bases differ (the ordering
+		// is meaningless across bases) or the remote copy is newer.
+		if baseMismatch || remoteFile.ModTime().Sub(localFile.ModTime()) > 0 {
 			filesNeedUpdate[remoteFile.Path()] = true
 		}
 	}
+	if len(realign) > 0 {
+		if err := rewriteModified(localDB, realign); err != nil {
+			return nil, err
+		}
+		slog.Info("Aligned media library timestamps to the metadata time base", "count", len(realign))
+	}
+	if baseMismatch && remoteBase != localBase {
+		// Record the planned migration; it is only committed after the
+		// copy phase succeeds (see finalizeMediaTimeBase), so a crash
+		// mid-copy leaves the conservative cross-base rules in force.
+		if err := setMeta(localDB, metaPendingTimeBase, remoteBase); err != nil {
+			return nil, err
+		}
+	}
 	return filesNeedUpdate, nil
+}
+
+// finalizeMediaTimeBase commits the time base migration planned by
+// prepareMetadataUpdate once the media copy has completed successfully.
+func finalizeMediaTimeBase(mediaDir string) error {
+	db, err := openMetadataDB(mediaDir)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	pending, err := getMeta(db, metaPendingTimeBase)
+	if err != nil {
+		return err
+	}
+	if pending == "" {
+		return nil
+	}
+	if err := setMeta(db, metaTimeBase, pending); err != nil {
+		return err
+	}
+	if err := deleteMeta(db, metaPendingTimeBase); err != nil {
+		return err
+	}
+	slog.Info("Finalized media library time base migration", "time_base", pending)
+	return nil
 }
 
 func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
@@ -406,6 +558,19 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 	}
 
 	slog.Info("Finalizing updates...")
+	if err := os.MkdirAll(cfg.MediaDir, dirPerm); err != nil {
+		return err
+	}
+	mediaRoot, err := os.OpenRoot(cfg.MediaDir)
+	if err != nil {
+		return err
+	}
+	defer mediaRoot.Close()
+	downloadRoot, err := os.OpenRoot(cfg.DownloadDir)
+	if err != nil {
+		return err
+	}
+	defer downloadRoot.Close()
 
 	o, err := url.Parse(cfg.AlistURL)
 	if err != nil {
@@ -413,13 +578,8 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 	}
 
 	for strm := range strmList {
-		fpath := filepath.Join(cfg.DownloadDir, strm)
-		dir := filepath.Dir(fpath)
-		if err := os.MkdirAll(dir, dirPerm); err != nil {
-			return err
-		}
-
-		p, err := os.ReadFile(fpath)
+		rel := rootRel(strm)
+		p, err := downloadRoot.ReadFile(rel)
 		if err != nil {
 			return err
 		}
@@ -439,34 +599,27 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 			s = uu.String()
 		}
 
-		target := filepath.Join(cfg.MediaDir, strm)
-		if err := os.MkdirAll(filepath.Dir(target), dirPerm); err != nil {
+		if err := mediaRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil {
 			return err
 		}
-		if err := os.WriteFile(target, []byte(s+"\n"), filePerm); err != nil {
+		if err := mediaRoot.WriteFile(rel, []byte(s+"\n"), filePerm); err != nil {
 			return err
 		}
 	}
 
-	localDB, err := sql.Open("sqlite3", filepath.Join(cfg.MediaDir, ".metadata.db"))
+	localDB, err := openMetadataDB(cfg.MediaDir)
 	if err != nil {
 		return err
 	}
 	defer localDB.Close()
 
-	remoteDB, err := sql.Open("sqlite3", filepath.Join(cfg.DownloadDir, ".metadata.db"))
+	remoteDB, err := openMetadataDB(cfg.DownloadDir)
 	if err != nil {
 		return err
 	}
 	defer remoteDB.Close()
 
 	for file := range otherList {
-		fpath := filepath.Join(cfg.DownloadDir, file)
-		dir := filepath.Dir(fpath)
-		if err := os.MkdirAll(dir, dirPerm); err != nil {
-			return err
-		}
-
 		remoteFile, err := pickFirstFile(remoteDB, file)
 		if err != nil {
 			return err
@@ -480,7 +633,7 @@ func (cfg *Config) syncMetadata(filesToUpdate map[string]bool) error {
 			return err
 		}
 
-		if err := copyFile(tx, remoteFile, filepath.Join(cfg.MediaDir, file), fpath); err != nil {
+		if err := copyFile(tx, remoteFile, mediaRoot, downloadRoot, rootRel(file)); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -528,10 +681,13 @@ func (cfg *Config) Command() *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.RunAsDaemon, "daemon", true, "Run as daemon in foreground.")
 	cmd.Flags().StringVar(&cfg.RunCron, "cron-expr", "0 0 * * *", "Cron expression as scheduled task. Must run as daemon.")
 	cmd.Flags().StringVarP(&cfg.LogLevel, "log-level", "l", defaultLogLevel(), "Minimum log level (debug, info, warn, error). Env: LOG_LEVEL.")
+	cmd.Flags().StringVar(&cfg.ListenAddr, "listen-addr", "127.0.0.1:9527", "Address for the read-only status page (progress and logs). Set to \"\" to disable; expose beyond localhost only on trusted networks.")
 	cmd.Flags().StringVarP(&cfg.MediaDir, "media-dir", "d", "/media", "Media directory of Emby to maintain metadata.")
 	cmd.Flags().StringVarP(&cfg.DownloadDir, "download-dir", "D", "/download", "Media directory of Emby to download metadata to.")
 	cmd.Flags().BoolVar(&cfg.Cleanup, "cleanup", false, "Cleanup downloaded metadata when file no longer exists on remote server.")
 	cmd.Flags().BoolVarP(&cfg.Purge, "purge", "p", true, "Whether to purge useless file or directory when media is no longer available.")
+	cmd.Flags().BoolVar(&cfg.ForceCrawl, "force-crawl", false, "Force HTML crawling mode instead of manifest-based metadata sync.")
+	cmd.Flags().IntVar(&cfg.DownloadWorkers, "download-workers", 0, "Number of concurrent download workers. 0 means auto (min(CPU, 8)).")
 	cmd.Flags().BoolVarP(&cfg.Help, "help", "h", false, "Print this message.")
 	cmd.Flags().BoolVarP(&version, "version", "v", false, "Print software version.")
 	cmd.Flags().StringSliceVarP(&cfg.MirrorURL, "mirror-url", "m", nil, "Specify the mirror URL to sync metadata from.")
@@ -558,6 +714,10 @@ func (cfg *Config) Validate() (int, error) {
 	_, err = cron.ParseStandard(cfg.RunCron)
 	if err != nil {
 		return 2, fmt.Errorf("invalid cron expression: %s", cfg.RunCron)
+	}
+
+	if cfg.DownloadWorkers < 0 || cfg.DownloadWorkers > 64 {
+		return 2, fmt.Errorf("invalid download workers %d (valid: 0-64, 0 means auto)", cfg.DownloadWorkers)
 	}
 
 	if cfg.AlistPathSkipVerifyFromFile != "" {
@@ -627,31 +787,43 @@ func getRootDir(path, scanDir string) string {
 	return ss[0]
 }
 
-func copyFile(tx *sql.Tx, file *MetadataFile, to, from string) error {
+func copyFile(tx *sql.Tx, file *MetadataFile, toRoot, fromRoot *os.Root, rel string) error {
 	stmt, err := tx.Prepare("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	if err := os.MkdirAll(filepath.Dir(to), dirPerm); err != nil {
+	if err := toRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil {
 		return err
 	}
 
-	toFile, err := os.Create(to)
+	tmp := tempPathFor(rel)
+	toFile, err := toRoot.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
 	if err != nil {
 		return err
 	}
-	defer toFile.Close()
 
-	fromFile, err := os.Open(from)
+	fromFile, err := fromRoot.Open(rel)
 	if err != nil {
+		toFile.Close()
+		toRoot.Remove(tmp)
 		return err
 	}
 	defer fromFile.Close()
 
-	_, err = io.Copy(toFile, fromFile)
-	if err != nil {
+	_, copyErr := io.Copy(toFile, fromFile)
+	closeErr := toFile.Close()
+	if copyErr != nil {
+		toRoot.Remove(tmp)
+		return copyErr
+	}
+	if closeErr != nil {
+		toRoot.Remove(tmp)
+		return closeErr
+	}
+	if err := toRoot.Rename(tmp, rel); err != nil {
+		toRoot.Remove(tmp)
 		return err
 	}
 

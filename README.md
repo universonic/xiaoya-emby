@@ -43,7 +43,10 @@ Flags:
       --cron-expr string                          Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
       --daemon                                    Run as daemon in foreground. (default true)
   -D, --download-dir string                       Media directory of Emby to download metadata to. (default "/download")
+      --download-workers int                      Number of concurrent download workers. 0 means auto (min(CPU, 8)).
+      --force-crawl                               Force HTML crawling mode instead of manifest-based metadata sync.
   -h, --help                                      Print this message.
+      --listen-addr string                        Address for the read-only status page (progress and logs). Set to "" to disable; expose beyond localhost only on trusted networks. (default "127.0.0.1:9527")
   -l, --log-level string                          Minimum log level (debug, info, warn, error). Env: LOG_LEVEL. (default "info")
   -d, --media-dir string                          Media directory of Emby to maintain metadata. (default "/media")
   -m, --mirror-url strings                        Specify the mirror URL to sync metadata from.
@@ -65,6 +68,26 @@ docker run -d --name xiaoya-emby -v ${MY_DOWNLOAD_FOLDER}:/download -v ${MY_MEDI
 ```
 
 Enjoy!
+
+### Metadata Sync Modes
+
+By default the program syncs metadata via the pre-built manifest (`/.scan.list.gz`) published by the mirrors: all mirrors are probed concurrently, only the ones serving exactly the newest manifest generation are used, and the whole download phase is skipped when the current manifest generation (compared by Last-Modified and content hash) matches the last processed one. Identical content under a different timestamp is detected via hash and skipped as well; such no-op rounds still run a small incremental local integrity check that repairs missing files. When the manifest is unavailable on every mirror, the program automatically falls back to the legacy HTML crawling mode.
+
+Notes:
+
+- The manifest does not cover every selected path (for example `/115`, `/ISO` and `/PikPak`). Such paths are skipped with a warning and their previously downloaded files are kept; run with `--force-crawl` periodically if you need them in sync via crawling.
+- A path that the manifest used to cover but no longer lists is treated as removed only after it stays absent across two consecutive manifest generations; until then its files are protected from cleanup.
+- Cleanup is disabled unless at least two mirrors serving the exact newest generation return identical manifest content. It is also disabled for malformed manifests and refuses to remove more than half of the local library or any root with at least 20 files.
+- Deletions are crash-safe: files are quarantined into `.trash/` before database rows are removed. On restart, quarantined files whose rows still exist are restored; only committed deletions are discarded. Success markers are written last.
+- On the first manifest-based run after an upgrade, existing records are migrated to the manifest time base in-place, without re-downloading unchanged files. The media library switches its time base only after a successful copy phase, so a crash mid-copy keeps the conservative comparison rules in force.
+- Manifest/file paths are accessed through Go's rooted filesystem API, so symbolic links cannot escape the configured download or media trees. Individual files, complete rounds, manifest paths and manifest entry counts are bounded to limit hostile-mirror resource use.
+- SQLite uses rollback journaling rather than WAL for compatibility with common NFS/SMB media volumes; downloaded file metadata is persisted by one batched writer.
+- `--force-crawl` disables the manifest mode entirely and restores the legacy crawling behavior.
+- `--download-workers` raises the download concurrency (default is the minimum of CPU count and 8; maximum 64). Keep it modest to stay friendly to the mirrors.
+
+### Status Page
+
+The program serves a read-only status page on `--listen-addr` (default `127.0.0.1:9527`, set the flag to `""` to disable). It shows the current sync phase (manifest/crawl mode, probing, downloading, comparing, copying, cleanup, sleeping), download progress with ETA, the mirror pool with freshness and latency, recent sync-round history, and the last 1000 log lines. The page polls `/api/status` and `/api/logs` every 2 seconds. Both endpoints are unauthenticated and read-only, and mirror URLs are shown with credentials stripped; expose the port beyond localhost only on networks you trust.
 
 ### Advanced Usage
 

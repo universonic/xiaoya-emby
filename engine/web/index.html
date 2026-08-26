@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xiaoya-emby 同步状态</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --blue: #58a6ff; --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  header h1 { font-size: 18px; margin: 0; }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    border: 1px solid var(--border); font-size: 12px; color: var(--muted);
+  }
+  .badge.mode-manifest { color: var(--purple); border-color: var(--purple); }
+  .badge.mode-crawl { color: var(--yellow); border-color: var(--yellow); }
+  .badge.phase { color: var(--blue); border-color: var(--blue); }
+  .badge.ok { color: var(--green); border-color: var(--green); }
+  .badge.warn { color: var(--yellow); border-color: var(--yellow); }
+  .badge.err { color: var(--red); border-color: var(--red); }
+  #stale { color: var(--muted); font-size: 12px; margin-left: auto; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  section h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .progress {
+    background: #21262d; border-radius: 999px; height: 22px; overflow: hidden; position: relative;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.05), inset 0 0 0 1px rgba(0,0,0,.25);
+  }
+  .progress .fill {
+    background: linear-gradient(180deg, #3f8ef7, #1f6feb 55%, #1a5fd0);
+    height: 100%; width: 0; transition: width .5s ease, background .3s ease;
+    position: relative; overflow: hidden; border-radius: inherit;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.25);
+  }
+  .progress .fill::after {
+    content: ""; position: absolute; inset: 0; opacity: 0; transition: opacity .3s ease;
+    background: linear-gradient(45deg, rgba(255,255,255,.15) 25%, transparent 25% 50%, rgba(255,255,255,.15) 50% 75%, transparent 75%);
+    background-size: 20px 20px;
+    animation: stripes .8s linear infinite;
+  }
+  .progress .fill.active::after { opacity: 1; }
+  .progress .fill.done { background: linear-gradient(180deg, #4cc26a, #2ea043 55%, #268a3c); }
+  .progress .fill.warn { background: linear-gradient(180deg, #e5b458, #d29922 55%, #b8881a); }
+  .progress.indeterminate .fill {
+    width: 32%;
+    background: linear-gradient(90deg, transparent, #1f6feb 40%, #58a6ff 60%, transparent);
+    animation: sweep 1.5s ease-in-out infinite alternate;
+    transition: none;
+  }
+  .progress.indeterminate .fill::after { display: none; }
+  .progress .label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.7); }
+  @keyframes stripes { to { background-position: 20px 0; } }
+  @keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(212%); } }
+  @media (prefers-reduced-motion: reduce) {
+    .progress .fill::after, .progress.indeterminate .fill { animation: none; }
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  .stat { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .stat .v { font-size: 16px; font-weight: 600; margin-top: 2px; word-break: break-all; }
+  .stat .v.alert { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.err { color: var(--red); }
+  .scroll { max-height: 340px; overflow: auto; }
+  #logs { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+  #logs .INFO { color: var(--text); } #logs .WARN { color: var(--yellow); } #logs .ERROR { color: var(--red); } #logs .DEBUG { color: var(--muted); }
+  #logs .t { color: var(--muted); }
+  .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; flex-wrap: wrap; }
+  select, button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 13px; }
+  .empty { color: var(--muted); }
+  a { color: var(--blue); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>xiaoya-emby 同步状态</h1>
+    <span class="badge" id="version">-</span>
+    <span class="badge" id="mode">-</span>
+    <span class="badge phase" id="phase">-</span>
+    <span id="stale">加载中…</span>
+  </header>
+
+  <section>
+    <h2>下载进度</h2>
+    <div class="progress"><div class="fill" id="bar"></div><div class="label" id="barlabel">-</div></div>
+    <div class="grid" style="margin-top:10px">
+      <div class="stat"><div class="k">清单条目</div><div class="v" id="d-total">-</div></div>
+      <div class="stat"><div class="k">本轮需下载</div><div class="v" id="d-planned">-</div></div>
+      <div class="stat"><div class="k">已下载</div><div class="v" id="d-done">-</div></div>
+      <div class="stat"><div class="k">失败</div><div class="v" id="d-failed">-</div></div>
+      <div class="stat"><div class="k">重试轮次</div><div class="v" id="d-retry">-</div></div>
+      <div class="stat"><div class="k">预计剩余</div><div class="v" id="d-eta">-</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>本轮概览</h2>
+    <div class="grid">
+      <div class="stat"><div class="k">本轮开始</div><div class="v" id="s-start">-</div></div>
+      <div class="stat"><div class="k">已耗时</div><div class="v" id="s-dur">-</div></div>
+      <div class="stat"><div class="k">下次运行</div><div class="v" id="s-next">-</div></div>
+      <div class="stat"><div class="k">清单 Last-Modified</div><div class="v" id="s-manifest">-</div></div>
+      <div class="stat"><div class="k">清理 (cleanup)</div><div class="v" id="s-cleanup">-</div></div>
+      <div class="stat"><div class="k">已删除</div><div class="v" id="s-deleted">-</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>镜像状态</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>镜像</th><th>状态</th><th>延迟</th><th>清单 Last-Modified</th></tr></thead>
+      <tbody id="mirrors"><tr><td colspan="4" class="empty">暂无数据</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>历史轮次</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>开始时间</th><th>耗时</th><th>模式</th><th>下载</th><th>删除</th><th>结果</th></tr></thead>
+      <tbody id="history"><tr><td colspan="6" class="empty">暂无数据</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>日志</h2>
+    <div class="controls">
+      <label>级别 <select id="level">
+        <option value="ALL" selected>全部</option>
+        <option value="INFO">INFO</option>
+        <option value="WARN">WARN</option>
+        <option value="ERROR">ERROR</option>
+      </select></label>
+      <label><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+      <button id="clear">清屏</button>
+    </div>
+    <div class="scroll"><div id="logs"><span class="empty">等待日志…</span></div></div>
+  </section>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const PHASES = {
+  "probing": "探测镜像", "downloading-manifest": "下载清单", "parsing-manifest": "解析清单",
+  "downloading": "下载元数据", "comparing": "校验 strm/Alist", "preparing": "生成更新计划",
+  "copying": "同步到媒体库", "cleanup": "清理过期文件", "sleeping": "休眠等待下次调度",
+  "idle": "空闲",
+};
+const MIRROR_STATES = {
+  "fresh": ["最新", "ok"], "stale": ["清单过期", "warn"], "crawl-only": ["仅爬取", ""], "invalid": ["失效", "err"],
+};
+const INDET_PHASES = new Set(["probing", "downloading-manifest", "parsing-manifest", "comparing", "preparing", "copying", "cleanup"]);
+let lastSeq = 0, lastUpdated = null, cached = [];
+
+function fmtTime(s) {
+  if (!s || s.startsWith("0001-")) return "-";
+  const d = new Date(s);
+  return isNaN(d) ? "-" : d.toLocaleString("zh-CN", { hour12: false });
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function pollStatus() {
+  let st;
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    st = await r.json();
+    lastUpdated = new Date();
+  } catch {
+    $("stale").textContent = "无法连接服务";
+    return;
+  }
+  $("stale").textContent = "更新于 " + lastUpdated.toLocaleTimeString("zh-CN", { hour12: false });
+
+  $("version").textContent = st.version || "-";
+  const mode = $("mode");
+  mode.textContent = st.mode === "crawl" ? "爬取模式" : "清单模式";
+  mode.className = "badge " + (st.mode === "crawl" ? "mode-crawl" : "mode-manifest");
+  const phase = $("phase");
+  phase.textContent = PHASES[st.phase] || st.phase || "-";
+  phase.className = "badge phase" + (st.phase === "sleeping" || st.phase === "idle" ? "" : "");
+
+  const d = st.download, planned = Math.max(d.planned, d.downloaded + d.failed);
+  const bar = $("bar"), track = bar.parentElement;
+  let trackCls = "progress", fillCls = "fill", label = "-", width = 0;
+  if (INDET_PHASES.has(st.phase)) {
+    trackCls = "progress indeterminate";
+    label = (PHASES[st.phase] || st.phase) + "…";
+  } else {
+    const pct = planned > 0 ? Math.min(100, Math.round(d.downloaded / planned * 100)) : (d.total > 0 ? 100 : 0);
+    width = pct;
+    if (planned > 0) {
+      if (pct >= 100) {
+        fillCls += d.failed > 0 ? " warn" : " done";
+        label = `完成：${d.downloaded} / ${planned}` + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
+      } else {
+        fillCls += d.failed > 0 ? " warn active" : " active";
+        label = `${d.downloaded} / ${planned}（${pct}%）` + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
+      }
+    } else if (d.total > 0) {
+      fillCls += " done";
+      label = st.manifest.short_circuit ? "清单未变化，本轮跳过下载" : "无待下载";
+    } else {
+      label = "无待下载";
+    }
+  }
+  track.className = trackCls;
+  bar.className = fillCls;
+  bar.style.width = INDET_PHASES.has(st.phase) ? "" : width + "%";
+  $("barlabel").textContent = label;
+  $("d-total").textContent = d.total || "-";
+  $("d-planned").textContent = d.planned || "0";
+  $("d-done").textContent = d.downloaded;
+  const failedEl = $("d-failed");
+  failedEl.textContent = d.failed;
+  failedEl.className = "v" + (d.failed > 0 ? " alert" : "");
+  $("d-retry").textContent = d.retry_round;
+  if (d.downloaded > 0 && planned > d.downloaded) {
+    const dur = (Date.now() - new Date(st.phase_started_at || st.round_started_at).getTime()) / 1000;
+    const rate = d.downloaded / Math.max(dur, 1);
+    const remain = Math.round((planned - d.downloaded) / rate);
+    $("d-eta").textContent = remain > 0 ? `约 ${remain}s（${rate.toFixed(1)}/s）` : "即将完成";
+  } else {
+    $("d-eta").textContent = d.planned === d.downloaded && d.planned > 0 ? "已完成" : "-";
+  }
+
+  $("s-start").textContent = fmtTime(st.round_started_at);
+  const durMs = st.round_started_at && !st.round_started_at.startsWith("0001-")
+    ? Date.now() - new Date(st.round_started_at).getTime() : null;
+  $("s-dur").textContent = durMs != null ? Math.round(durMs / 1000) + "s" : "-";
+  $("s-next").textContent = fmtTime(st.next_run_at);
+  $("s-manifest").textContent = st.manifest.last_modified || "-";
+  $("s-cleanup").innerHTML = st.cleanup.enabled
+    ? (st.cleanup.guard_triggered ? '<span class="badge err">已触发删除守卫</span>' : '<span class="badge ok">已启用</span>')
+    : '<span class="badge">未启用</span>';
+  $("s-deleted").textContent = st.cleanup.deleted;
+
+  if (st.mirrors && st.mirrors.length) {
+    $("mirrors").innerHTML = st.mirrors.map((m) => {
+      const s = MIRROR_STATES[m.state] || [m.state, ""];
+      return `<tr><td>${esc(m.url)}</td><td><span class="badge ${s[1]}">${esc(s[0])}</span></td><td>${m.latency_ms ? m.latency_ms + "ms" : "-"}</td><td>${esc(m.last_modified || "-")}</td></tr>`;
+    }).join("");
+  }
+  if (st.history && st.history.length) {
+    $("history").innerHTML = st.history.map((h) =>
+      `<tr><td>${fmtTime(h.started_at)}</td><td>${Math.round(h.duration_ms / 1000)}s</td>` +
+      `<td>${h.mode === "crawl" ? "爬取" : "清单"}</td><td>${h.downloaded}${h.short_circuit ? "（短路）" : ""}</td><td>${h.deleted}</td>` +
+      `<td class="${h.error ? "err" : ""}">${esc(h.error || "成功")}</td></tr>`
+    ).join("");
+  }
+}
+
+async function pollLogs() {
+  let data;
+  try {
+    const r = await fetch("/api/logs?after=" + lastSeq, { cache: "no-store" });
+    data = await r.json();
+  } catch { return; }
+  if (data.records && data.records.length) {
+    cached = cached.concat(data.records).slice(-2000);
+    lastSeq = data.records[data.records.length - 1].seq;
+    renderLogs();
+  }
+}
+
+function renderLogs() {
+  const filter = $("level").value;
+  const rows = cached.filter((r) => filter === "ALL" || r.level === filter || r.level === "ERROR");
+  const box = $("logs");
+  box.innerHTML = rows.length
+    ? rows.map((r) => `<div class="${r.level}"><span class="t">${esc(r.time)}</span> ${r.level} ${esc(r.msg)}${r.attrs ? " " + esc(r.attrs) : ""}</div>`).join("")
+    : '<span class="empty">暂无日志</span>';
+  if ($("autoscroll").checked) box.parentElement.scrollTop = box.parentElement.scrollHeight;
+}
+
+async function loop() {
+  for (;;) {
+    await Promise.all([pollStatus(), pollLogs()]);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+$("level").addEventListener("change", renderLogs);
+$("clear").addEventListener("click", () => { cached = []; renderLogs(); });
+loop();
+</script>
+</body>
+</html>

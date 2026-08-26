@@ -1,6 +1,6 @@
 NAME=xiaoya-emby
 BINDIR=bin
-VERSION=v0.1.0
+VERSION=v0.2.0
 
 GOBUILD=go build -tags with_gvisor -trimpath -ldflags '-X "github.com/universonic/xiaoya-emby/engine.Version=$(VERSION)" \
 		-w -s -buildid='
