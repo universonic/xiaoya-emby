@@ -136,7 +136,7 @@ func TestStatusHTTPHandlers(t *testing.T) {
 	statusRingLog = h
 	defer func() { statusRingLog = nil }()
 
-	srv := httptest.NewServer(statusHTTPHandler())
+	srv := httptest.NewServer(statusHTTPHandler(nil))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/api/status")

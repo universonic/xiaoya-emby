@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -133,29 +134,6 @@ func TestParseScanListEntryLimit(t *testing.T) {
 	}
 }
 
-func TestNearHourOffset(t *testing.T) {
-	cases := []struct {
-		delta int64
-		want  bool
-	}{
-		{0, true},
-		{45, true},
-		{91, false},
-		{-4 * 3600, true},
-		{-4*3600 - 50, true},
-		{-4*3600 - 120, false},
-		{3600, true},
-		{26 * 3600, true},
-		{26*3600 + 1, false},
-		{5 * 3600, true},
-	}
-	for _, c := range cases {
-		if got := nearHourOffset(c.delta); got != c.want {
-			t.Errorf("nearHourOffset(%d) = %v, want %v", c.delta, got, c.want)
-		}
-	}
-}
-
 func TestSanitizeURL(t *testing.T) {
 	cases := map[string]string{
 		"https://emby.xiaoya.pro/":                        "https://emby.xiaoya.pro/",
@@ -198,7 +176,7 @@ func TestDownloadRejectsSymlinkEscape(t *testing.T) {
 	}))
 	defer srv.Close()
 	mc.client = srv.Client()
-	_, err := mc.Download("/电影/out.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true})
+	_, err := mc.Download(context.Background(), "/电影/out.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true})
 	if err == nil {
 		t.Fatal("download through escaping symlink unexpectedly succeeded")
 	}
@@ -216,7 +194,7 @@ func TestDownloadRejectsOversizedResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 	mc.client = srv.Client()
-	_, err := mc.Download("/电影/huge.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true})
+	_, err := mc.Download(context.Background(), "/电影/huge.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true})
 	if err == nil || !strings.Contains(err.Error(), "size limit") {
 		t.Fatalf("err = %v, want size limit error", err)
 	}
@@ -228,7 +206,7 @@ func TestProbeRejectsFutureManifestTimestamp(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
-	if _, _, ok := probeScanList(srv.URL); ok {
+	if _, _, ok := probeScanList(context.Background(), srv.URL); ok {
 		t.Fatal("future manifest timestamp was accepted")
 	}
 }
@@ -240,10 +218,10 @@ func TestReconcileTrashRestoresUncommittedDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := createFileTable(db); err != nil {
+	if err := createFileTable(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("INSERT INTO files VALUES (?,?,?,?,?)", "/电影/a.nfo", "a.nfo", 4, 1, "e"); err != nil {
+	if _, err := db.Exec("INSERT INTO files ("+filesTableColumns+") VALUES (?,?,?,?,?,?,?,?)", "/电影/a.nfo", "a.nfo", 4, 1, "e", timeBaseHTTP, "e:4", provenanceETag); err != nil {
 		t.Fatal(err)
 	}
 	if err := mc.fsRoot.MkdirAll(filepath.Join(trashDirName, "电影"), dirPerm); err != nil {
@@ -252,7 +230,7 @@ func TestReconcileTrashRestoresUncommittedDeletion(t *testing.T) {
 	if err := mc.fsRoot.WriteFile(filepath.Join(trashDirName, "电影", "a.nfo"), []byte("data"), filePerm); err != nil {
 		t.Fatal(err)
 	}
-	if err := mc.reconcileTrash(db); err != nil {
+	if err := mc.reconcileTrash(context.Background(), db, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := mc.fsRoot.ReadFile(filepath.Join("电影", "a.nfo")); err != nil || string(got) != "data" {
@@ -267,7 +245,7 @@ func TestReconcileTrashDropsCommittedDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := createFileTable(db); err != nil {
+	if err := createFileTable(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
 	if err := mc.fsRoot.MkdirAll(filepath.Join(trashDirName, "电影"), dirPerm); err != nil {
@@ -276,7 +254,7 @@ func TestReconcileTrashDropsCommittedDeletion(t *testing.T) {
 	if err := mc.fsRoot.WriteFile(filepath.Join(trashDirName, "电影", "gone.nfo"), []byte("data"), filePerm); err != nil {
 		t.Fatal(err)
 	}
-	if err := mc.reconcileTrash(db); err != nil {
+	if err := mc.reconcileTrash(context.Background(), db, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := mc.fsRoot.Stat(trashDirName); !os.IsNotExist(err) {
@@ -291,7 +269,7 @@ func TestWriteMetadataFilesBatchesRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := createFileTable(db); err != nil {
+	if err := createFileTable(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
 	files := make(chan *MetadataFile, 300)
@@ -299,7 +277,7 @@ func TestWriteMetadataFilesBatchesRows(t *testing.T) {
 		files <- &MetadataFile{path: fmt.Sprintf("/电影/%03d.nfo", i), name: "x.nfo", size: 1, modified: 1, etag: "e"}
 	}
 	close(files)
-	if err := writeMetadataFiles(db, files); err != nil {
+	if err := writeMetadataFiles(context.Background(), db, files); err != nil {
 		t.Fatal(err)
 	}
 	var count int

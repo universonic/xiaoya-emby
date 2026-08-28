@@ -2,18 +2,30 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+)
+
+// alistClientTimeout bounds every Alist API call; requests are also bound
+// by the round context so hangs cannot outlive their sync round.
+const alistClientTimeout = 30 * time.Second
+
+// alistMaxPages and alistMaxEntries bound one ReadDir so a misbehaving
+// server cannot loop the pagination forever.
+const (
+	alistMaxPages   = 100_000
+	alistMaxEntries = 1_000_000
 )
 
 type AlistClient struct {
@@ -22,69 +34,86 @@ type AlistClient struct {
 	client *http.Client
 }
 
-func (c *AlistClient) get(path string) (*AlistGetResult, error) {
+func NewAlistClient(endpoint string) (*AlistClient, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return &AlistClient{Endpoint: u, client: newBrowserClient(alistClientTimeout)}, nil
+}
+
+// doPOST performs the JSON POST with bounded retries. Every attempt builds
+// a fresh request (the body reader cannot be reused) and closes the
+// response body, including on failures.
+func (c *AlistClient) doPOST(ctx context.Context, opName, apiPath, path string, payload any) ([]byte, error) {
 	u := *c.Endpoint
-	u.Path = "api/fs/get"
+	u.Path = apiPath
 
-	p, _ := json.Marshal(AlistGetPayload{
-		Path: path,
-	})
-
-	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(p))
-	if err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", GlobalUserAgent)
-
-	var resp *http.Response
+	var lastErr error
 	for range 3 {
-		resp, err = c.client.Do(req)
+		if ctx.Err() != nil {
+			return nil, &fs.PathError{Op: opName, Path: path, Err: ctx.Err()}
+		}
+		p, err := json.Marshal(payload)
 		if err != nil {
-			if err, ok := err.(*url.Error); ok {
-				err := err.Err
-				_, ok := err.(*net.OpError)
-				if ok || err == io.EOF {
-					time.Sleep(time.Second * 10)
-					continue
-				}
+			return nil, &fs.PathError{Op: opName, Path: path, Err: err}
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(p))
+		if err != nil {
+			return nil, &fs.PathError{Op: opName, Path: path, Err: err}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", GlobalUserAgent)
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if serr := sleepContext(ctx, backoffFor(err)); serr != nil {
+				return nil, &fs.PathError{Op: opName, Path: path, Err: serr}
 			}
-			time.Sleep(time.Second * 3)
 			continue
 		}
-		defer resp.Body.Close()
-
 		if resp.StatusCode != http.StatusOK {
-			err = errors.New(resp.Status)
-			time.Sleep(time.Second * 3)
+			lastErr = errors.New(resp.Status)
+			resp.Body.Close()
+			if serr := sleepContext(ctx, 3*time.Second); serr != nil {
+				return nil, &fs.PathError{Op: opName, Path: path, Err: serr}
+			}
 			continue
 		}
-		break
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return body, nil
 	}
-	if err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
-	}
+	return nil, &fs.PathError{Op: opName, Path: path, Err: lastErr}
+}
 
-	p, err = io.ReadAll(resp.Body)
+func (c *AlistClient) get(ctx context.Context, path string) (*AlistGetResult, error) {
+	body, err := c.doPOST(ctx, "Get", "api/fs/get", path, AlistGetPayload{Path: path})
 	if err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
+		return nil, err
 	}
-
 	r := &AlistGetResult{}
-	if err = json.Unmarshal(p, r); err != nil {
+	if err := json.Unmarshal(body, r); err != nil {
 		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
 	}
 	return r, nil
 }
 
-func (c *AlistClient) Stat(path string) (os.FileInfo, error) {
-	r, err := c.get(path)
+func (c *AlistClient) Stat(ctx context.Context, path string) (os.FileInfo, error) {
+	r, err := c.get(ctx, path)
 	if err != nil {
 		return nil, err
 	}
+	if err := alistCodeError(r.Code, r.Message); err != nil {
+		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
+	}
 	if r.Data == nil {
-		return nil, fs.ErrNotExist
+		return nil, &fs.PathError{Op: "Get", Path: path, Err: fmt.Errorf("alist get returned no data for %s", path)}
 	}
 	return AlistFile{
 		path:     path,
@@ -95,76 +124,67 @@ func (c *AlistClient) Stat(path string) (os.FileInfo, error) {
 	}, nil
 }
 
-func (c *AlistClient) list(path string, page, perPage int) (*AlistListResult, error) {
-	u := *c.Endpoint
-	u.Path = "api/fs/list"
-
-	p, _ := json.Marshal(AlistListPayload{
+func (c *AlistClient) list(ctx context.Context, path string, page, perPage int) (*AlistListResult, error) {
+	body, err := c.doPOST(ctx, "List", "api/fs/list", path, AlistListPayload{
 		Path:    path,
 		Page:    page,
 		PerPage: perPage,
 	})
-
-	req, err := http.NewRequest("POST", u.String(), bytes.NewReader(p))
 	if err != nil {
-		return nil, &fs.PathError{Op: "List", Path: path, Err: err}
+		return nil, err
 	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", GlobalUserAgent)
-
-	var resp *http.Response
-	for range 3 {
-		resp, err = c.client.Do(req)
-		if err != nil {
-			if err, ok := err.(*url.Error); ok {
-				err := err.Err
-				_, ok := err.(*net.OpError)
-				if ok || err == io.EOF {
-					time.Sleep(time.Second * 10)
-					continue
-				}
-			}
-			time.Sleep(time.Second * 3)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			err = errors.New(resp.Status)
-			time.Sleep(time.Second * 3)
-			continue
-		}
-		break
-	}
-	if err != nil {
-		return nil, &fs.PathError{Op: "List", Path: path, Err: err}
-	}
-
-	p, err = io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, &fs.PathError{Op: "List", Path: path, Err: err}
-	}
-
 	r := &AlistListResult{}
-	if err = json.Unmarshal(p, r); err != nil {
+	if err := json.Unmarshal(body, r); err != nil {
 		return nil, &fs.PathError{Op: "List", Path: path, Err: err}
 	}
 	return r, nil
 }
 
-func (c *AlistClient) ReadDir(path string) ([]os.FileInfo, error) {
+// alistCodeError classifies Alist API result codes: success is 200; an
+// object-not-found response is fs.ErrNotExist; anything else is a hard
+// error that must fail the verification phase (never silently produce a
+// deletion plan). The match is limited to object-level not-found phrases
+// so that infrastructure errors like "storage not found" (a disabled or
+// missing storage driver) are never treated as a missing object.
+func alistCodeError(code int, message string) error {
+	if code == 200 {
+		return nil
+	}
+	msg := strings.ToLower(strings.TrimSpace(message))
+	if strings.Contains(msg, "object not found") || strings.Contains(msg, "path not found") {
+		return fs.ErrNotExist
+	}
+	return fmt.Errorf("alist api error %d: %s", code, message)
+}
+
+// ReadDir lists a directory with full pagination validation: the API code
+// must be success, Data must be non-nil, every page must make forward
+// progress toward Total, and the result must be complete. Anything else is
+// an error; a partial listing is never returned.
+func (c *AlistClient) ReadDir(ctx context.Context, path string) ([]os.FileInfo, error) {
 	var files []os.FileInfo
 	count, total := 0, 1
 	for i := 1; count < total; i++ {
-		r, err := c.list(path, i, 1024)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if i > alistMaxPages || count > alistMaxEntries {
+			return nil, &fs.PathError{Op: "List", Path: path, Err: fmt.Errorf("alist listing for %s exceeds pagination limits", path)}
+		}
+		r, err := c.list(ctx, path, i, 1024)
 		if err != nil {
 			return nil, err
 		}
+		if err := alistCodeError(r.Code, r.Message); err != nil {
+			return nil, &fs.PathError{Op: "List", Path: path, Err: err}
+		}
 		if r.Data == nil {
-			return nil, fs.ErrNotExist
+			return nil, &fs.PathError{Op: "List", Path: path, Err: fmt.Errorf("alist list returned no data for %s", path)}
 		}
 		n := len(r.Data.Content)
+		if n == 0 && r.Data.Total > count {
+			return nil, &fs.PathError{Op: "List", Path: path, Err: fmt.Errorf("alist listing for %s stalled at page %d (%d/%d)", path, i, count, r.Data.Total)}
+		}
 		count += n
 		total = r.Data.Total
 
@@ -182,12 +202,12 @@ func (c *AlistClient) ReadDir(path string) ([]os.FileInfo, error) {
 	return files, nil
 }
 
-func (c *AlistClient) Walk(root string, fn WalkFunc) error {
-	info, err := c.Stat(root)
+func (c *AlistClient) Walk(ctx context.Context, root string, fn WalkFunc) error {
+	info, err := c.Stat(ctx, root)
 	if err != nil {
 		err = fn(root, nil, err)
 	} else {
-		err = c.walk(root, info, fn)
+		err = c.walk(ctx, root, info, fn)
 	}
 	if err == filepath.SkipDir || err == filepath.SkipAll {
 		return nil
@@ -195,27 +215,26 @@ func (c *AlistClient) Walk(root string, fn WalkFunc) error {
 	return err
 }
 
-func (c *AlistClient) walk(path string, info os.FileInfo, walkFn WalkFunc) error {
+func (c *AlistClient) walk(ctx context.Context, path string, info os.FileInfo, walkFn WalkFunc) error {
 	if !info.IsDir() {
 		return walkFn(path, info, nil)
 	}
 
-	fileInfos, err := c.ReadDir(path)
+	fileInfos, err := c.ReadDir(ctx, path)
 	err1 := walkFn(path, info, err)
 	// If err != nil, walk can't walk into this directory.
 	// err1 != nil means walkFn want walk to skip this directory or stop walking.
 	// Therefore, if one of err and err1 isn't nil, walk will return.
 	if err != nil || err1 != nil {
-		// The caller's behavior is controlled by the return value, which is decided
-		// by walkFn. walkFn may ignore err and return nil.
-		// If walkFn returns SkipDir or SkipAll, it will be handled by the caller.
-		// So walk should return whatever walkFn returns.
 		return err1
 	}
 	sort.Slice(fileInfos, func(i, j int) bool { return fileInfos[i].Name() < fileInfos[j].Name() })
 
 	for _, fileInfo := range fileInfos {
-		err = c.walk(filepath.Join(path, fileInfo.Name()), fileInfo, walkFn)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err = c.walk(ctx, filepath.Join(path, fileInfo.Name()), fileInfo, walkFn)
 		if err != nil {
 			if !fileInfo.IsDir() || err != filepath.SkipDir {
 				return err
@@ -305,14 +324,6 @@ func (t *Timestamp) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return p, nil
-}
-
-func NewAlistClient(endpoint string) (*AlistClient, error) {
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, err
-	}
-	return &AlistClient{Endpoint: u, client: http.DefaultClient}, nil
 }
 
 // AlistFile is file in Alist

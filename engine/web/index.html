@@ -77,9 +77,44 @@
   #logs .INFO { color: var(--text); } #logs .WARN { color: var(--yellow); } #logs .ERROR { color: var(--red); } #logs .DEBUG { color: var(--muted); }
   #logs .t { color: var(--muted); }
   .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; flex-wrap: wrap; }
-  select, button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 13px; }
+  select, button, input, textarea {
+    background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 3px 8px; font-size: 13px; font-family: inherit;
+  }
+  textarea { width: 100%; min-height: 60px; resize: vertical; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  input[type="checkbox"] { accent-color: var(--blue); }
+  button { cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { border-color: #1f6feb; color: #fff; background: #1f6feb; }
+  button.danger { border-color: var(--red); color: var(--red); background: transparent; }
+  .ops { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .ops .jobstate { font-size: 12px; color: var(--muted); }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .cfg-field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .cfg-field input[type="text"], .cfg-field input[type="number"], .cfg-field input[type="password"] { width: 100%; }
+  .cfg-field .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .cfg-full { grid-column: 1 / -1; }
+  .checkboxes { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; }
+  .checkboxes label { display: flex; align-items: center; gap: 6px; }
+  .msg { font-size: 12px; margin-top: 8px; }
+  .msg.ok { color: var(--green); }
+  .msg.err { color: var(--red); }
+  .msg.warn { color: var(--yellow); }
+  dialog {
+    background: var(--panel); color: var(--text); border: 1px solid var(--red);
+    border-radius: 8px; max-width: 520px; width: calc(100% - 32px); padding: 18px;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  dialog h3 { margin: 0 0 10px; color: var(--red); font-size: 15px; }
+  dialog ul { max-height: 220px; overflow: auto; margin: 8px 0; padding-left: 20px; }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
   .empty { color: var(--muted); }
   a { color: var(--blue); }
+  @media (max-width: 640px) {
+    .cfg-grid { grid-template-columns: 1fr; }
+    .ops { flex-direction: column; align-items: stretch; }
+    .ops > * { width: 100%; }
+  }
 </style>
 </head>
 <body>
@@ -92,6 +127,27 @@
     <span id="stale">加载中…</span>
   </header>
 
+  <section id="ops-section">
+    <h2>同步控制</h2>
+    <div class="ops">
+      <label>同步类型
+        <select id="sync-type">
+          <option value="incremental" selected>增量同步（默认）</option>
+          <option value="full-relaxed">宽松全量（按大小/时间复用）</option>
+          <option value="full-strict">严格全量（清空后全部重新下载）</option>
+        </select>
+      </label>
+      <button class="primary" id="trigger">触发同步</button>
+      <button class="danger" id="abort" disabled>中止当前任务</button>
+      <span class="jobstate" id="job-state">-</span>
+    </div>
+    <div class="msg" id="ops-msg"></div>
+    <div class="controls" style="margin-top:10px">
+      <label>控制令牌 <input type="password" id="token" placeholder="Bearer token（仅保存在当前会话）" style="width:240px"></label>
+      <span class="hint" id="token-hint"></span>
+    </div>
+  </section>
+
   <section>
     <h2>下载进度</h2>
     <div class="progress"><div class="fill" id="bar"></div><div class="label" id="barlabel">-</div></div>
@@ -99,6 +155,7 @@
       <div class="stat"><div class="k">清单条目</div><div class="v" id="d-total">-</div></div>
       <div class="stat"><div class="k">本轮需下载</div><div class="v" id="d-planned">-</div></div>
       <div class="stat"><div class="k">已下载</div><div class="v" id="d-done">-</div></div>
+      <div class="stat"><div class="k">复用</div><div class="v" id="d-reused">-</div></div>
       <div class="stat"><div class="k">失败</div><div class="v" id="d-failed">-</div></div>
       <div class="stat"><div class="k">重试轮次</div><div class="v" id="d-retry">-</div></div>
       <div class="stat"><div class="k">预计剩余</div><div class="v" id="d-eta">-</div></div>
@@ -115,6 +172,58 @@
       <div class="stat"><div class="k">清理 (cleanup)</div><div class="v" id="s-cleanup">-</div></div>
       <div class="stat"><div class="k">已删除</div><div class="v" id="s-deleted">-</div></div>
     </div>
+    <div class="msg" id="pending-msg"></div>
+  </section>
+
+  <section id="cfg-section" hidden>
+    <h2>同步配置</h2>
+    <div class="cfg-grid">
+      <div class="cfg-field cfg-full">
+        <label>运行行为</label>
+        <div class="checkboxes">
+          <label><input type="checkbox" id="c-download"> 更新下载缓存（mode bit 4）</label>
+          <label><input type="checkbox" id="c-media"> 同步媒体库（mode bit 1）</label>
+          <label><input type="checkbox" id="c-cleanup"> 清理下载缓存（cleanup）</label>
+          <label><input type="checkbox" id="c-purge"> 校验并清理媒体库（purge）</label>
+          <label><input type="checkbox" id="c-forcecrawl"> 强制 HTML 爬取（force-crawl）</label>
+        </div>
+        <div class="hint">关闭“更新下载缓存”会同时禁用两种全量重建；若存在未完成的全量操作，恢复将被暂停且媒体同步被阻止，直到重新开启。</div>
+      </div>
+      <div class="cfg-field">
+        <label for="c-cron">Cron 表达式</label>
+        <input type="text" id="c-cron" placeholder="0 0 * * *">
+      </div>
+      <div class="cfg-field">
+        <label for="c-workers">下载并发（0-64，0=自动）</label>
+        <input type="number" id="c-workers" min="0" max="64">
+      </div>
+      <div class="cfg-field">
+        <label for="c-alist">Alist 地址（根路径）</label>
+        <input type="text" id="c-alist" placeholder="http://xiaoya.host:5678">
+      </div>
+      <div class="cfg-field">
+        <label for="c-strmroot">strm 根路径</label>
+        <input type="text" id="c-strmroot" placeholder="/d">
+      </div>
+      <div class="cfg-field cfg-full">
+        <label for="c-mirrors">镜像列表（每行一个 http(s) 地址，留空使用内置镜像）</label>
+        <textarea id="c-mirrors"></textarea>
+      </div>
+      <div class="cfg-field cfg-full">
+        <label for="c-alistskip">Alist 跳过校验路径（每行一个）</label>
+        <textarea id="c-alistskip"></textarea>
+      </div>
+      <div class="cfg-field cfg-full">
+        <label for="c-strmskip">strm 跳过校验路径（每行一个）</label>
+        <textarea id="c-strmskip"></textarea>
+      </div>
+    </div>
+    <div class="controls" style="margin-top:12px">
+      <button class="primary" id="cfg-save">保存配置</button>
+      <button id="cfg-reset">恢复启动配置</button>
+      <span class="hint" id="cfg-rev"></span>
+    </div>
+    <div class="msg" id="cfg-msg"></div>
   </section>
 
   <section>
@@ -128,8 +237,8 @@
   <section>
     <h2>历史轮次</h2>
     <div class="scroll"><table>
-      <thead><tr><th>开始时间</th><th>耗时</th><th>模式</th><th>下载</th><th>删除</th><th>结果</th></tr></thead>
-      <tbody id="history"><tr><td colspan="6" class="empty">暂无数据</td></tr></tbody>
+      <thead><tr><th>开始时间</th><th>耗时</th><th>类型</th><th>发现</th><th>下载</th><th>复用</th><th>删除</th><th>结果</th></tr></thead>
+      <tbody id="history"><tr><td colspan="8" class="empty">暂无数据</td></tr></tbody>
     </table></div>
   </section>
 
@@ -149,20 +258,43 @@
   </section>
 </div>
 
+<dialog id="strict-dialog">
+  <h3>确认严格全量重建</h3>
+  <p>严格全量将<b>清空下载缓存中的以下同步目录</b>并重新下载全部内容（媒体库不会被清空）：</p>
+  <ul id="strict-roots"></ul>
+  <p class="hint">该操作不可中途静默回退：中止后任何后续同步都会先恢复未完成的全量操作。</p>
+  <div class="actions">
+    <button id="strict-cancel">取消</button>
+    <button class="danger" id="strict-confirm">确认清空并重建</button>
+  </div>
+</dialog>
+
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
 const PHASES = {
   "probing": "探测镜像", "downloading-manifest": "下载清单", "parsing-manifest": "解析清单",
-  "downloading": "下载元数据", "comparing": "校验 strm/Alist", "preparing": "生成更新计划",
+  "inventory": "构建全量清单", "clearing-cache": "清空下载缓存", "downloading": "下载元数据",
+  "rebuilding-index": "重建索引/复用", "comparing": "校验 strm/Alist", "preparing": "生成更新计划",
   "copying": "同步到媒体库", "cleanup": "清理过期文件", "sleeping": "休眠等待下次调度",
   "idle": "空闲",
+};
+const SYNC_TYPES = { "incremental": "增量", "full-relaxed": "宽松全量", "full-strict": "严格全量" };
+const TRIGGERS = { "startup": "启动", "cron": "定时", "manual": "手动" };
+const OUTCOMES = {
+  "success": ["成功", "ok"], "failed": ["失败", "err"], "canceled": ["已中止", "warn"], "deferred": ["等待条件", "warn"],
 };
 const MIRROR_STATES = {
   "fresh": ["最新", "ok"], "stale": ["清单过期", "warn"], "crawl-only": ["仅爬取", ""], "invalid": ["失效", "err"],
 };
-const INDET_PHASES = new Set(["probing", "downloading-manifest", "parsing-manifest", "comparing", "preparing", "copying", "cleanup"]);
+const INDET_PHASES = new Set(["probing", "downloading-manifest", "parsing-manifest", "inventory", "clearing-cache", "cleanup"]);
 let lastSeq = 0, lastUpdated = null, cached = [];
+let cfgRevision = null;
+
+const state = {
+  get token() { return sessionStorage.getItem("xiaoya-token") || ""; },
+  set token(v) { v ? sessionStorage.setItem("xiaoya-token", v) : sessionStorage.removeItem("xiaoya-token"); $("token").value = v; },
+};
 
 function fmtTime(s) {
   if (!s || s.startsWith("0001-")) return "-";
@@ -171,6 +303,195 @@ function fmtTime(s) {
 }
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  if (opts.method && opts.method !== "GET") headers["X-Requested-With"] = "xiaoya-emby";
+  const r = await fetch(path, { method: opts.method || "GET", headers, body: opts.body, cache: "no-store" });
+  let payload = null;
+  try { payload = await r.json(); } catch { /* non-JSON */ }
+  return { status: r.status, ok: r.ok, payload };
+}
+function apiErrMsg(resp) {
+  if (resp.payload && resp.payload.error) return resp.payload.error.message || resp.payload.error.code;
+  return "HTTP " + resp.status;
+}
+
+function opsMsg(text, cls) {
+  const el = $("ops-msg");
+  el.textContent = text || "";
+  el.className = "msg" + (cls ? " " + cls : "");
+}
+
+let strictPending = null;
+async function triggerSync(mode, confirm) {
+  opsMsg("正在提交…");
+  const resp = await api("/api/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, confirm: !!confirm }) });
+  if (resp.status === 202) {
+    const eff = resp.payload.effective_mode;
+    const note = eff && eff !== mode ? `；所选模式被未完成的全量恢复覆盖为「${SYNC_TYPES[eff] || eff}」` : "";
+    opsMsg(`已接受任务 ${resp.payload.job_id}${note}`, "ok");
+    return;
+  }
+  if (resp.payload && resp.payload.error && resp.payload.error.code === "confirm_required") {
+    strictPending = mode;
+    openStrictDialog();
+    return;
+  }
+  opsMsg(apiErrMsg(resp), "err");
+}
+
+function openStrictDialog() {
+  const roots = (window.__syncRoots || []).map((r) => `<li>${esc(r)}</li>`).join("") || "<li>（全部同步目录）</li>";
+  $("strict-roots").innerHTML = roots;
+  $("strict-dialog").showModal();
+}
+
+async function abortSync() {
+  opsMsg("正在请求中止…");
+  const resp = await api("/api/sync/abort", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (resp.status === 202) {
+    opsMsg(resp.payload.cancel_requested ? "已请求取消，等待任务退出…" : "任务正在收尾…", "ok");
+    return;
+  }
+  opsMsg(apiErrMsg(resp), "err");
+}
+
+async function loadConfig() {
+  const resp = await api("/api/config");
+  const sec = $("cfg-section");
+  if (resp.status === 403 || resp.status === 503) {
+    sec.hidden = false;
+    $("cfg-rev").textContent = resp.status === 403 ? "只读模式：控制需要令牌" : "控制不可用（非守护进程）";
+    setInputsDisabled(true);
+    return;
+  }
+  if (!resp.ok) return;
+  const cfg = resp.payload;
+  cfgRevision = cfg.revision;
+  sec.hidden = false;
+  setInputsDisabled(false);
+  const s = cfg.settings;
+  window.__cfgMode = s.run_mode;
+  $("c-download").checked = !!(s.run_mode & 4);
+  $("c-media").checked = !!(s.run_mode & 1);
+  $("c-cleanup").checked = !!s.cleanup;
+  $("c-purge").checked = !!s.purge;
+  $("c-forcecrawl").checked = !!s.force_crawl;
+  $("c-cron").value = s.run_cron || "";
+  $("c-workers").value = s.download_workers ?? 0;
+  $("c-alist").value = s.alist_url || "";
+  $("c-strmroot").value = s.alist_strm_root_path || "";
+  $("c-mirrors").value = (s.mirror_url || []).join("\n");
+  $("c-alistskip").value = (s.alist_path_skip_verify || []).join("\n");
+  $("c-strmskip").value = (s.strm_path_skip_verify || []).join("\n");
+  $("cfg-rev").textContent = `修订版本 ${cfg.revision}${cfg.persisted ? "（已持久化覆盖）" : "（启动基线）"}${cfg.persist_error ? " · 持久化异常" : ""}`;
+  cfgMsg("");
+}
+
+function collectConfig() {
+  // Preserve the unused bit 2 of the previous mode value.
+  let mode = 0;
+  if ($("c-download").checked) mode |= 4;
+  if ($("c-media").checked) mode |= 1;
+  const prev = window.__cfgMode ?? 7;
+  mode |= prev & 2;
+  const lines = (v) => v.split("\n").map((s) => s.trim()).filter((s) => s !== "");
+  return {
+    run_mode: mode,
+    run_cron: $("c-cron").value.trim(),
+    cleanup: $("c-cleanup").checked,
+    purge: $("c-purge").checked,
+    force_crawl: $("c-forcecrawl").checked,
+    download_workers: parseInt($("c-workers").value || "0", 10) || 0,
+    alist_url: $("c-alist").value.trim(),
+    alist_strm_root_path: $("c-strmroot").value.trim(),
+    mirror_url: lines($("c-mirrors").value),
+    alist_path_skip_verify: lines($("c-alistskip").value),
+    strm_path_skip_verify: lines($("c-strmskip").value),
+  };
+}
+
+function cfgMsg(text, cls) {
+  const el = $("cfg-msg");
+  el.textContent = text || "";
+  el.className = "msg" + (cls ? " " + cls : "");
+}
+
+async function saveConfig() {
+  if (cfgRevision === null) return;
+  const body = { revision: cfgRevision, settings: collectConfig() };
+  const resp = await api("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (resp.status === 200) {
+    cfgRevision = resp.payload.revision;
+    window.__cfgMode = resp.payload.settings.run_mode;
+    $("cfg-rev").textContent = `修订版本 ${resp.payload.revision}（已持久化覆盖）`;
+    cfgMsg("配置已保存，将从下一轮同步生效。", "ok");
+    return;
+  }
+  if (resp.payload && resp.payload.error && resp.payload.error.code === "revision_conflict") {
+    cfgMsg("保存冲突：配置已被其他会话修改，正在重新加载。", "err");
+    loadConfig();
+    return;
+  }
+  cfgMsg(apiErrMsg(resp), "err");
+}
+
+async function resetConfig() {
+  if (!confirm("删除持久化覆盖并恢复进程启动时的配置？")) return;
+  const resp = await api("/api/config", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: "{}" });
+  if (resp.status === 200) {
+    await loadConfig();
+    cfgMsg("已恢复启动基线配置，将从下一轮同步生效。", "ok");
+    return;
+  }
+  cfgMsg(apiErrMsg(resp), "err");
+}
+
+function setInputsDisabled(disabled) {
+  ["c-download", "c-media", "c-cleanup", "c-purge", "c-forcecrawl", "c-cron", "c-workers", "c-alist",
+   "c-strmroot", "c-mirrors", "c-alistskip", "c-strmskip", "cfg-save", "cfg-reset"].forEach((id) => { $(id).disabled = disabled; });
+}
+
+function renderOps(st) {
+  const control = st.control || {};
+  const running = st.running;
+  const canControl = control.available;
+  const readOnly = control.read_only;
+  $("trigger").disabled = !canControl || running || readOnly;
+  $("abort").disabled = !canControl || !running || readOnly;
+  $("sync-type").disabled = !canControl || running || readOnly;
+  $("token-hint").textContent = !canControl ? "控制不可用（非守护进程模式）" : readOnly ? "未配置 --control-token：只读模式" : "";
+  if (readOnly) state.token && ($("token-hint").textContent += " · 输入令牌以启用控制");
+
+  const type = st.sync_type ? (SYNC_TYPES[st.sync_type] || st.sync_type) : "-";
+  let job = running
+    ? `任务 ${st.job_id || "-"} · ${type}${st.trigger_source ? " · " + (TRIGGERS[st.trigger_source] || st.trigger_source) : ""}${st.cancel_requested ? " · 正在取消" : ""}`
+    : "空闲";
+  if (st.effective_mode && st.sync_type && st.effective_mode !== st.sync_type) job += `（生效模式：${SYNC_TYPES[st.effective_mode] || st.effective_mode}）`;
+  $("job-state").textContent = job;
+
+  const sel = $("sync-type");
+  if (!running) {
+    // Keep the full modes selectable only while the download stage is on.
+    const downloadOn = window.__cfgMode === undefined || !!(window.__cfgMode & 4);
+    for (const opt of sel.options) {
+      if (opt.value === "full-relaxed" || opt.value === "full-strict") opt.disabled = !downloadOn;
+    }
+  }
+
+  const pm = $("pending-msg");
+  if (st.pending_recovery) {
+    pm.className = "msg warn";
+    pm.textContent = st.recovery_paused
+      ? "存在未完成的全量重建：下载阶段已被关闭，恢复处于暂停状态，媒体同步也被一致性闸门阻止；重新开启下载阶段后将在下一次触发时继续恢复。"
+      : "存在未完成的全量重建：后续任何同步都会先恢复该操作，所选模式将被覆盖。";
+  } else {
+    pm.textContent = "";
+    pm.className = "msg";
+  }
 }
 
 async function pollStatus() {
@@ -193,22 +514,25 @@ async function pollStatus() {
   phase.textContent = PHASES[st.phase] || st.phase || "-";
   phase.className = "badge phase" + (st.phase === "sleeping" || st.phase === "idle" ? "" : "");
 
-  const d = st.download, planned = Math.max(d.planned, d.downloaded + d.failed);
+  window.__syncRoots = st.sync_roots || [];
+  renderOps(st);
+
+  const d = st.download, planned = Math.max(d.planned, d.downloaded + d.failed + d.reused);
   const bar = $("bar"), track = bar.parentElement;
   let trackCls = "progress", fillCls = "fill", label = "-", width = 0;
   if (INDET_PHASES.has(st.phase)) {
     trackCls = "progress indeterminate";
     label = (PHASES[st.phase] || st.phase) + "…";
   } else {
-    const pct = planned > 0 ? Math.min(100, Math.round(d.downloaded / planned * 100)) : (d.total > 0 ? 100 : 0);
+    const pct = planned > 0 ? Math.min(100, Math.round((d.downloaded + d.reused) / planned * 100)) : (d.total > 0 ? 100 : 0);
     width = pct;
     if (planned > 0) {
       if (pct >= 100) {
         fillCls += d.failed > 0 ? " warn" : " done";
-        label = `完成：${d.downloaded} / ${planned}` + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
+        label = `完成：${d.downloaded + d.reused} / ${planned}` + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
       } else {
         fillCls += d.failed > 0 ? " warn active" : " active";
-        label = `${d.downloaded} / ${planned}（${pct}%）` + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
+        label = `${d.downloaded + d.reused} / ${planned}（${pct}%）` + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
       }
     } else if (d.total > 0) {
       fillCls += " done";
@@ -224,17 +548,18 @@ async function pollStatus() {
   $("d-total").textContent = d.total || "-";
   $("d-planned").textContent = d.planned || "0";
   $("d-done").textContent = d.downloaded;
+  $("d-reused").textContent = d.reused;
   const failedEl = $("d-failed");
   failedEl.textContent = d.failed;
   failedEl.className = "v" + (d.failed > 0 ? " alert" : "");
   $("d-retry").textContent = d.retry_round;
-  if (d.downloaded > 0 && planned > d.downloaded) {
+  if (d.downloaded + d.reused > 0 && planned > d.downloaded + d.reused) {
     const dur = (Date.now() - new Date(st.phase_started_at || st.round_started_at).getTime()) / 1000;
-    const rate = d.downloaded / Math.max(dur, 1);
-    const remain = Math.round((planned - d.downloaded) / rate);
+    const rate = (d.downloaded + d.reused) / Math.max(dur, 1);
+    const remain = Math.round((planned - d.downloaded - d.reused) / rate);
     $("d-eta").textContent = remain > 0 ? `约 ${remain}s（${rate.toFixed(1)}/s）` : "即将完成";
   } else {
-    $("d-eta").textContent = d.planned === d.downloaded && d.planned > 0 ? "已完成" : "-";
+    $("d-eta").textContent = d.planned === d.downloaded + d.reused && d.planned > 0 ? "已完成" : "-";
   }
 
   $("s-start").textContent = fmtTime(st.round_started_at);
@@ -255,11 +580,14 @@ async function pollStatus() {
     }).join("");
   }
   if (st.history && st.history.length) {
-    $("history").innerHTML = st.history.map((h) =>
-      `<tr><td>${fmtTime(h.started_at)}</td><td>${Math.round(h.duration_ms / 1000)}s</td>` +
-      `<td>${h.mode === "crawl" ? "爬取" : "清单"}</td><td>${h.downloaded}${h.short_circuit ? "（短路）" : ""}</td><td>${h.deleted}</td>` +
-      `<td class="${h.error ? "err" : ""}">${esc(h.error || "成功")}</td></tr>`
-    ).join("");
+    $("history").innerHTML = st.history.map((h) => {
+      const out = OUTCOMES[h.outcome] || (h.error ? ["失败", "err"] : ["成功", "ok"]);
+      return `<tr><td>${fmtTime(h.started_at)}</td><td>${Math.round(h.duration_ms / 1000)}s</td>` +
+        `<td>${esc(SYNC_TYPES[h.sync_type] || "增量")}${h.trigger ? " · " + esc(TRIGGERS[h.trigger] || h.trigger) : ""}</td>` +
+        `<td>${h.mode === "crawl" ? "爬取" : "清单"}</td>` +
+        `<td>${h.downloaded}${h.short_circuit ? "（短路）" : ""}</td><td>${h.reused}</td><td>${h.deleted}</td>` +
+        `<td class="${out[1]}">${esc(h.error || out[0])}${h.outcome && !h.error ? "" : ""}</td></tr>`;
+    }).join("");
   }
 }
 
@@ -286,14 +614,36 @@ function renderLogs() {
   if ($("autoscroll").checked) box.parentElement.scrollTop = box.parentElement.scrollHeight;
 }
 
+$("trigger").addEventListener("click", () => {
+  const mode = $("sync-type").value;
+  if (mode === "full-strict") { strictPending = mode; openStrictDialog(); return; }
+  triggerSync(mode, false);
+});
+$("strict-cancel").addEventListener("click", () => { $("strict-dialog").close(); strictPending = null; });
+$("strict-confirm").addEventListener("click", () => {
+  $("strict-dialog").close();
+  triggerSync(strictPending || "full-strict", true);
+  strictPending = null;
+});
+$("abort").addEventListener("click", abortSync);
+$("cfg-save").addEventListener("click", saveConfig);
+$("cfg-reset").addEventListener("click", resetConfig);
+$("token").addEventListener("change", () => {
+  state.token = $("token").value.trim();
+  opsMsg(state.token ? "令牌已保存到当前会话。" : "令牌已清除。", "ok");
+  loadConfig();
+});
+$("level").addEventListener("change", renderLogs);
+$("clear").addEventListener("click", () => { cached = []; renderLogs(); });
+
+state.token = sessionStorage.getItem("xiaoya-token") || "";
+loadConfig();
 async function loop() {
   for (;;) {
     await Promise.all([pollStatus(), pollLogs()]);
     await new Promise((r) => setTimeout(r, 2000));
   }
 }
-$("level").addEventListener("change", renderLogs);
-$("clear").addEventListener("click", () => { cached = []; renderLogs(); });
 loop();
 </script>
 </body>

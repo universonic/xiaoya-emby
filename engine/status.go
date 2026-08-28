@@ -3,13 +3,11 @@ package engine
 import (
 	"context"
 	"embed"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,22 +16,44 @@ import (
 
 // Sync phases reported by the status page.
 const (
-	PhaseProbing     = "probing"
-	PhaseManifest    = "downloading-manifest"
-	PhaseParsing     = "parsing-manifest"
-	PhaseDownloading = "downloading"
-	PhaseComparing   = "comparing"
-	PhasePreparing   = "preparing"
-	PhaseCopying     = "copying"
-	PhaseCleanup     = "cleanup"
-	PhaseSleeping    = "sleeping"
-	PhaseIdle        = "idle"
+	PhaseProbing       = "probing"
+	PhaseManifest      = "downloading-manifest"
+	PhaseParsing       = "parsing-manifest"
+	PhaseInventory     = "inventory"
+	PhaseClearingCache = "clearing-cache"
+	PhaseDownloading   = "downloading"
+	PhaseRebuilding    = "rebuilding-index"
+	PhaseCleanup       = "cleanup"
+	PhaseSleeping      = "sleeping"
+	PhaseIdle          = "idle"
 )
 
-// Sync modes.
+// Sync modes (discovery method of the download phase).
 const (
 	ModeManifest = "manifest"
 	ModeCrawl    = "crawl"
+)
+
+// Sync types selectable by manual trigger.
+const (
+	SyncTypeIncremental = "incremental"
+	SyncTypeFullRelaxed = "full-relaxed"
+	SyncTypeFullStrict  = "full-strict"
+)
+
+// Trigger sources of a sync round.
+const (
+	TriggerStartup = "startup"
+	TriggerCron    = "cron"
+	TriggerManual  = "manual"
+)
+
+// Round outcomes.
+const (
+	OutcomeSuccess  = "success"
+	OutcomeFailed   = "failed"
+	OutcomeCanceled = "canceled"
+	OutcomeDeferred = "deferred"
 )
 
 // Mirror states derived from probe results.
@@ -70,9 +90,13 @@ type roundStatus struct {
 	StartedAt    time.Time `json:"started_at"`
 	DurationMs   int64     `json:"duration_ms"`
 	Mode         string    `json:"mode"`
+	SyncType     string    `json:"sync_type,omitempty"`
+	Trigger      string    `json:"trigger,omitempty"`
 	Downloaded   int       `json:"downloaded"`
+	Reused       int       `json:"reused"`
 	Deleted      int       `json:"deleted"`
 	ShortCircuit bool      `json:"short_circuit"`
+	Outcome      string    `json:"outcome,omitempty"`
 	Error        string    `json:"error,omitempty"`
 }
 
@@ -88,6 +112,25 @@ type statusSnapshot struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 	NextRunAt      *time.Time `json:"next_run_at,omitempty"`
 
+	SyncType        string `json:"sync_type,omitempty"`
+	TriggerSource   string `json:"trigger_source,omitempty"`
+	EffectiveMode   string `json:"effective_mode,omitempty"`
+	JobID           string `json:"job_id,omitempty"`
+	Running         bool   `json:"running"`
+	CancelRequested bool   `json:"cancel_requested"`
+	PendingRecovery bool   `json:"pending_recovery"`
+	RecoveryPaused  bool   `json:"recovery_paused"`
+
+	ConfigRevision int64 `json:"config_revision"`
+	ConfigError    bool  `json:"config_error"`
+
+	SyncRoots []string `json:"sync_roots,omitempty"`
+
+	Control struct {
+		Available bool `json:"available"`
+		ReadOnly  bool `json:"read_only"`
+	} `json:"control"`
+
 	Manifest struct {
 		LastModified string `json:"last_modified,omitempty"`
 		Entries      int    `json:"entries"`
@@ -98,6 +141,7 @@ type statusSnapshot struct {
 		Total      int `json:"total"`
 		Planned    int `json:"planned"`
 		Downloaded int `json:"downloaded"`
+		Reused     int `json:"reused"`
 		Failed     int `json:"failed"`
 		RetryRound int `json:"retry_round"`
 	} `json:"download"`
@@ -122,8 +166,25 @@ type syncStatus struct {
 	phaseStarted  time.Time
 	roundStarted  time.Time
 	roundDownload int
+	roundReused   int
 	roundDeleted  int
 	nextRun       *time.Time
+
+	syncType        string
+	triggerSource   string
+	effectiveMode   string
+	jobID           string
+	running         bool
+	cancelRequested bool
+	pendingRecovery bool
+	recoveryPaused  bool
+
+	configRevision int64
+	configError    bool
+	syncRoots      []string
+
+	controlAvailable bool
+	controlReadOnly  bool
 
 	manifestLastModified string
 	manifestEntries      int
@@ -132,6 +193,7 @@ type syncStatus struct {
 	downloadTotal      int
 	downloadPlanned    int
 	downloadDownloaded int
+	downloadReused     int
 	downloadFailed     int
 	downloadRetryRound int
 
@@ -159,23 +221,103 @@ func (s *syncStatus) setMode(mode string) {
 	s.mode = mode
 }
 
+// setSyncType records the effective sync type once pending recovery is
+// resolved.
+func (s *syncStatus) setSyncType(syncType string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncType = syncType
+}
+
+// setJob marks a round as running with its identity.
+func (s *syncStatus) setJob(syncType, trigger, effectiveMode, jobID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncType = syncType
+	s.triggerSource = trigger
+	s.effectiveMode = effectiveMode
+	s.jobID = jobID
+	s.running = true
+	s.cancelRequested = false
+}
+
+func (s *syncStatus) clearJob() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = false
+	s.cancelRequested = false
+	s.jobID = ""
+}
+
+func (s *syncStatus) setCancelRequested(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancelRequested = v
+}
+
+// setPending records whether an unfinished full rebuild exists and whether
+// its recovery is paused by the download stage being disabled.
+func (s *syncStatus) setPending(pending, paused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingRecovery = pending
+	s.recoveryPaused = paused
+}
+
+func (s *syncStatus) setConfig(revision int64, persistErr bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.configRevision = revision
+	s.configError = persistErr
+}
+
+func (s *syncStatus) setSyncRoots(roots []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncRoots = append([]string(nil), roots...)
+}
+
+func (s *syncStatus) setControl(available, readOnly bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.controlAvailable = available
+	s.controlReadOnly = readOnly
+}
+
 func (s *syncStatus) roundStart() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.roundStarted = time.Now()
 	s.roundDownload = 0
+	s.roundReused = 0
 	s.roundDeleted = 0
 	s.manifestShortCircuit = false
 	s.downloadTotal = 0
 	s.downloadPlanned = 0
 	s.downloadDownloaded = 0
+	s.downloadReused = 0
 	s.downloadFailed = 0
 	s.downloadRetryRound = 0
 	s.cleanupDeleted = 0
 	s.cleanupGuardTriggered = false
 }
 
+// roundEnd appends the round to the history; the outcome is inferred from
+// the error (nil → success, canceled, otherwise failed).
 func (s *syncStatus) roundEnd(err error) {
+	outcome := OutcomeSuccess
+	if err != nil {
+		outcome = OutcomeFailed
+		if isCanceledErr(err) {
+			outcome = OutcomeCanceled
+		}
+	}
+	s.roundEndWith(err, outcome)
+}
+
+// roundEndWith appends the round to the history with an explicit outcome
+// (e.g. deferred rounds that are not failures).
+func (s *syncStatus) roundEndWith(err error, outcome string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.roundStarted.IsZero() {
@@ -185,9 +327,13 @@ func (s *syncStatus) roundEnd(err error) {
 		StartedAt:    s.roundStarted,
 		DurationMs:   time.Since(s.roundStarted).Milliseconds(),
 		Mode:         s.mode,
+		SyncType:     s.syncType,
+		Trigger:      s.triggerSource,
 		Downloaded:   s.roundDownload,
+		Reused:       s.roundReused,
 		Deleted:      s.roundDeleted,
 		ShortCircuit: s.manifestShortCircuit,
+		Outcome:      outcome,
 	}
 	if err != nil {
 		r.Error = err.Error()
@@ -197,6 +343,10 @@ func (s *syncStatus) roundEnd(err error) {
 		s.history = s.history[:statusHistoryLimit]
 	}
 	s.roundStarted = time.Time{}
+}
+
+func isCanceledErr(err error) bool {
+	return err != nil && (err == context.Canceled || err == context.DeadlineExceeded || strings.Contains(err.Error(), "context canceled"))
 }
 
 func (s *syncStatus) setNextRun(t *time.Time) {
@@ -219,6 +369,7 @@ func (s *syncStatus) setDownloadPlan(total, planned int) {
 	s.downloadTotal = total
 	s.downloadPlanned = planned
 	s.downloadDownloaded = 0
+	s.downloadReused = 0
 	s.downloadFailed = 0
 	s.downloadRetryRound = 0
 }
@@ -228,6 +379,13 @@ func (s *syncStatus) incDownloaded() {
 	defer s.mu.Unlock()
 	s.downloadDownloaded++
 	s.roundDownload++
+}
+
+func (s *syncStatus) incReused() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.downloadReused++
+	s.roundReused++
 }
 
 func (s *syncStatus) incFailed() {
@@ -271,20 +429,34 @@ func (s *syncStatus) snapshot() statusSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snap := statusSnapshot{
-		Version:        Version,
-		Mode:           s.mode,
-		Phase:          s.phase,
-		PhaseStartedAt: s.phaseStarted,
-		RoundStartedAt: s.roundStarted,
-		UpdatedAt:      time.Now(),
-		NextRunAt:      s.nextRun,
+		Version:         Version,
+		Mode:            s.mode,
+		Phase:           s.phase,
+		PhaseStartedAt:  s.phaseStarted,
+		RoundStartedAt:  s.roundStarted,
+		UpdatedAt:       time.Now(),
+		NextRunAt:       s.nextRun,
+		SyncType:        s.syncType,
+		TriggerSource:   s.triggerSource,
+		EffectiveMode:   s.effectiveMode,
+		JobID:           s.jobID,
+		Running:         s.running,
+		CancelRequested: s.cancelRequested,
+		PendingRecovery: s.pendingRecovery,
+		RecoveryPaused:  s.recoveryPaused,
+		ConfigRevision:  s.configRevision,
+		ConfigError:     s.configError,
+		SyncRoots:       append([]string(nil), s.syncRoots...),
 	}
+	snap.Control.Available = s.controlAvailable
+	snap.Control.ReadOnly = s.controlReadOnly
 	snap.Manifest.LastModified = s.manifestLastModified
 	snap.Manifest.Entries = s.manifestEntries
 	snap.Manifest.ShortCircuit = s.manifestShortCircuit
 	snap.Download.Total = s.downloadTotal
 	snap.Download.Planned = s.downloadPlanned
 	snap.Download.Downloaded = s.downloadDownloaded
+	snap.Download.Reused = s.downloadReused
 	snap.Download.Failed = s.downloadFailed
 	snap.Download.RetryRound = s.downloadRetryRound
 	snap.Cleanup.Enabled = s.cleanupEnabled
@@ -447,43 +619,6 @@ func installRingLogHandler() {
 //go:embed web/index.html
 var statusWebFS embed.FS
 
-// statusHTTPHandler builds the HTTP routes of the status page.
-func statusHTTPHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(globalStatus.snapshot())
-	})
-	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
-		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-		var records []logRecord
-		if statusRingLog != nil {
-			records = statusRingLog.logsAfter(after)
-		}
-		if records == nil {
-			records = []logRecord{}
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(w).Encode(map[string]any{"records": records})
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		body, err := statusWebFS.ReadFile("web/index.html")
-		if err != nil {
-			http.Error(w, "status page unavailable", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(body)
-	})
-	return mux
-}
-
 // limitConcurrency bounds the number of in-flight status page requests;
 // excess requests receive 503 instead of tying up process resources.
 func limitConcurrency(h http.Handler) http.Handler {
@@ -499,9 +634,10 @@ func limitConcurrency(h http.Handler) http.Handler {
 	})
 }
 
-// startStatusServer serves the status page on addr until ctx is done. The
-// returned channel is closed once the server has fully shut down.
-func startStatusServer(ctx context.Context, addr string) <-chan struct{} {
+// startStatusServer serves the status/control page on addr until ctx is
+// done. The returned channel is closed once the server has fully shut
+// down.
+func startStatusServer(ctx context.Context, addr string, handler http.Handler) <-chan struct{} {
 	done := make(chan struct{})
 
 	ln, err := net.Listen("tcp", addr)
@@ -512,7 +648,7 @@ func startStatusServer(ctx context.Context, addr string) <-chan struct{} {
 	}
 
 	srv := &http.Server{
-		Handler:           limitConcurrency(statusHTTPHandler()),
+		Handler:           limitConcurrency(handler),
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      60 * time.Second,
