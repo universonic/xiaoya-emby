@@ -723,23 +723,10 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 	}
 
 	mirrors := mc.activeManifestMirrors()
-	lastModified := mc.activeManifestLastModified()
 	if len(mirrors) == 0 {
 		return errNoManifest
 	}
 
-	timeBase, err := getMeta(ctx, db, metaTimeBase)
-	if err != nil {
-		return err
-	}
-	storedLastModified, err := getMeta(ctx, db, metaScanListLastModified)
-	if err != nil {
-		return err
-	}
-	storedHash, err := getMeta(ctx, db, metaScanListHash)
-	if err != nil {
-		return err
-	}
 	coveredRootsMeta, err := getMeta(ctx, db, metaCoveredRoots)
 	if err != nil {
 		return err
@@ -747,33 +734,6 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 	pendingDropsMeta, err := getMeta(ctx, db, metaPendingRootDrops)
 	if err != nil {
 		return err
-	}
-
-	// Short-circuit the whole download phase when the newest manifest
-	// generation is exactly the one already processed. Exact equality is
-	// required: a tolerance window could skip a genuinely regenerated
-	// manifest. The shortcut is also skipped while legacy 'unknown'
-	// time-base rows remain: they must go through the diff's identity
-	// verification once so the media phase stops conservatively
-	// re-copying them every round.
-	if timeBase == timeBaseManifest && storedLastModified != "" && lastModified != "" {
-		storedT, err1 := time.Parse(time.RFC1123, storedLastModified)
-		currentT, err2 := time.Parse(time.RFC1123, lastModified)
-		if err1 == nil && err2 == nil && currentT.Equal(storedT) {
-			unknown, err := hasUnknownBaseRows(ctx, db)
-			if err != nil {
-				return err
-			}
-			if !unknown {
-				slog.Info("Metadata manifest unchanged since last sync, skipping download phase", "last_modified", lastModified)
-				if err := mc.integritySweep(ctx, db, mirrors); err != nil {
-					return err
-				}
-				globalStatus.setManifest(lastModified, 0, true)
-				return nil
-			}
-			slog.Info("Manifest unchanged but legacy rows await re-identification; running the diff")
-		}
 	}
 
 	body, bodyLastModified, bodySource, err := fetchScanList(ctx, mirrors)
@@ -806,29 +766,6 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 				globalStatus.setCleanupGuard(true)
 			}
 		}
-	}
-
-	// The generation differs by timestamp but the content is identical
-	// (mirrors regenerate at slightly different times): refresh the stored
-	// generation marker after the integrity sweep and skip the diff. The
-	// same legacy-row gate as the timestamp short-circuit applies.
-	if timeBase == timeBaseManifest && storedHash != "" && storedHash == bodyHash {
-		unknown, err := hasUnknownBaseRows(ctx, db)
-		if err != nil {
-			return err
-		}
-		if !unknown {
-			if err := mc.integritySweep(ctx, db, mirrors); err != nil {
-				return err
-			}
-			slog.Info("Metadata manifest content unchanged, skipping diff", "last_modified", bodyLastModified)
-			if err := setMeta(ctx, db, metaScanListLastModified, bodyLastModified); err != nil {
-				return err
-			}
-			globalStatus.setManifest(bodyLastModified, 0, true)
-			return nil
-		}
-		slog.Info("Manifest content unchanged but legacy rows await re-identification; running the diff")
 	}
 
 	selectedRoots := make(map[string]bool, len(mc.selectedPaths))
@@ -1771,31 +1708,34 @@ func (mc *MetadataCrawler) Stat(ctx context.Context, path string) (fi os.FileInf
 }
 
 // get fetches the HTML directory listing of path from exactly one mirror.
-// It returns (nil, nil) when the response is not an HTML document.
-func (mc *MetadataCrawler) get(ctx context.Context, mirror, path string) ([]*MetadataFile, error) {
+// listing is true only when the HTML carries a recognizable autoindex
+// marker; generic 200 HTML pages must not become authoritative empty roots.
+func (mc *MetadataCrawler) get(ctx context.Context, mirror, path string) (files []*MetadataFile, listing bool, err error) {
 	u, err := url.Parse(mirror)
 	if err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
+		return nil, false, &fs.PathError{Op: "Get", Path: path, Err: err}
 	}
 	u.Path = filepath.Join(u.Path, path)
 
 	var resp *http.Response
 	var lastErr error
-	for range 3 {
+	for attempt := range 3 {
 		if ctx.Err() != nil {
-			return nil, &fs.PathError{Op: "Get", Path: path, Err: ctx.Err()}
+			return nil, false, &fs.PathError{Op: "Get", Path: path, Err: ctx.Err()}
 		}
 		req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimSuffix(u.String(), "/")+"/", nil)
 		if err != nil {
-			return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
+			return nil, false, &fs.PathError{Op: "Get", Path: path, Err: err}
 		}
 		setNavigationHeaders(req.Header)
 
 		resp, err = mc.client.Do(req)
 		if err != nil {
 			lastErr = err
-			if serr := sleepContext(ctx, backoffFor(err)); serr != nil {
-				return nil, &fs.PathError{Op: "Get", Path: path, Err: serr}
+			if attempt < 2 {
+				if serr := sleepContext(ctx, backoffFor(err)); serr != nil {
+					return nil, false, &fs.PathError{Op: "Get", Path: path, Err: serr}
+				}
 			}
 			continue
 		}
@@ -1805,18 +1745,20 @@ func (mc *MetadataCrawler) get(ctx context.Context, mirror, path string) ([]*Met
 			notFound := resp.StatusCode == http.StatusNotFound
 			resp.Body.Close()
 			if notFound {
-				return nil, &fs.PathError{Op: "Get", Path: path, Err: fs.ErrNotExist}
+				return nil, false, &fs.PathError{Op: "Get", Path: path, Err: fs.ErrNotExist}
 			}
 			lastErr = status
-			if serr := sleepContext(ctx, 3*time.Second); serr != nil {
-				return nil, &fs.PathError{Op: "Get", Path: path, Err: serr}
+			if attempt < 2 {
+				if serr := sleepContext(ctx, 3*time.Second); serr != nil {
+					return nil, false, &fs.PathError{Op: "Get", Path: path, Err: serr}
+				}
 			}
 			continue
 		}
 		break
 	}
-	if resp == nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: lastErr}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		return nil, false, &fs.PathError{Op: "Get", Path: path, Err: lastErr}
 	}
 	defer resp.Body.Close()
 
@@ -1826,17 +1768,26 @@ func (mc *MetadataCrawler) get(ctx context.Context, mirror, path string) ([]*Met
 		contentType = strings.TrimSpace(ss[0])
 	}
 	if contentType != "text/html" {
-		return nil, nil
+		return nil, false, nil
 	}
 
-	files := []*MetadataFile{}
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
+		return nil, false, &fs.PathError{Op: "Get", Path: path, Err: err}
+	}
+	for _, marker := range []string{doc.Find("title").First().Text(), doc.Find("h1").First().Text()} {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(marker)), "index of") {
+			listing = true
+			break
+		}
 	}
 	doc.Find("a").Each(func(i int, s *goquery.Selection) {
 		href, ok := s.Attr("href")
 		if !ok {
+			return
+		}
+		if href = strings.TrimSpace(href); href == ".." || href == "../" {
+			listing = true
 			return
 		}
 		link, err := url.Parse(href)
@@ -1872,19 +1823,19 @@ func (mc *MetadataCrawler) get(ctx context.Context, mirror, path string) ([]*Met
 			})
 		}
 	})
-	return files, nil
+	return files, listing, nil
 }
 
 // getPinned fetches a listing from exactly one mirror and fails when the
 // response is not a valid HTML listing. Full-inventory crawls must not
 // silently accept non-HTML responses.
 func (mc *MetadataCrawler) getPinned(ctx context.Context, mirror, path string) ([]*MetadataFile, error) {
-	files, err := mc.get(ctx, mirror, path)
+	files, listing, err := mc.get(ctx, mirror, path)
 	if err != nil {
 		return nil, err
 	}
-	if files == nil {
-		return nil, fmt.Errorf("mirror %s returned a non-HTML listing for %s", sanitizeURL(mirror), path)
+	if !listing {
+		return nil, fmt.Errorf("mirror %s returned an invalid directory listing for %s", sanitizeURL(mirror), path)
 	}
 	return files, nil
 }
@@ -1895,7 +1846,7 @@ func (mc *MetadataCrawler) ReadDir(ctx context.Context, path string) (fileInfos 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		files, err = mc.get(ctx, mirror, path)
+		files, _, err = mc.get(ctx, mirror, path)
 		if err != nil {
 			continue
 		}
@@ -2006,7 +1957,7 @@ func (mc *MetadataCrawler) download(ctx context.Context, mirror, path string, o 
 
 	var resp *http.Response
 	var lastErr error
-	for range 3 {
+	for attempt := range 3 {
 		if ctx.Err() != nil {
 			return nil, &fs.PathError{Op: "Get", Path: path, Err: ctx.Err()}
 		}
@@ -2023,8 +1974,10 @@ func (mc *MetadataCrawler) download(ctx context.Context, mirror, path string, o 
 		if err != nil {
 			slog.Warn("Error downloading", "mirror", sanitizeURL(mirror), "path", path, "error", err)
 			lastErr = err
-			if serr := sleepContext(ctx, backoffFor(err)); serr != nil {
-				return nil, &fs.PathError{Op: "Get", Path: path, Err: serr}
+			if attempt < 2 {
+				if serr := sleepContext(ctx, backoffFor(err)); serr != nil {
+					return nil, &fs.PathError{Op: "Get", Path: path, Err: serr}
+				}
 			}
 			continue
 		}
@@ -2038,14 +1991,16 @@ func (mc *MetadataCrawler) download(ctx context.Context, mirror, path string, o 
 				return nil, &fs.PathError{Op: "Get", Path: path, Err: fs.ErrNotExist}
 			}
 			lastErr = status
-			if serr := sleepContext(ctx, 3*time.Second); serr != nil {
-				return nil, &fs.PathError{Op: "Get", Path: path, Err: serr}
+			if attempt < 2 {
+				if serr := sleepContext(ctx, 3*time.Second); serr != nil {
+					return nil, &fs.PathError{Op: "Get", Path: path, Err: serr}
+				}
 			}
 			continue
 		}
 		break
 	}
-	if resp == nil {
+	if resp == nil || resp.StatusCode != http.StatusOK {
 		return nil, &fs.PathError{Op: "Get", Path: path, Err: lastErr}
 	}
 	defer resp.Body.Close()

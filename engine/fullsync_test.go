@@ -38,6 +38,7 @@ type mirrorTestServer struct {
 	files       map[string]mirrorFile
 	dirs        map[string][]string // dir path (with trailing /) -> child names
 	nonHTMLDirs map[string]bool
+	invalidHTML map[string]bool
 	failPaths   map[string]int // path -> status code
 
 	getCount map[string]int
@@ -50,6 +51,7 @@ func newMirrorServer(t *testing.T) *mirrorTestServer {
 		files:       map[string]mirrorFile{},
 		dirs:        map[string][]string{},
 		nonHTMLDirs: map[string]bool{},
+		invalidHTML: map[string]bool{},
 		failPaths:   map[string]int{},
 		getCount:    map[string]int{},
 	}
@@ -105,6 +107,7 @@ func (m *mirrorTestServer) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Last-Modified", m.manifestLM)
 		w.Header().Set("Content-Length", strconv.Itoa(len(m.manifestGz)))
 		if r.Method == "GET" {
+			m.getCount[p]++
 			w.Write(m.manifestGz)
 		}
 		return
@@ -141,8 +144,13 @@ func (m *mirrorTestServer) handle(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("not a listing"))
 			return
 		}
+		if m.invalidHTML[p] {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte("<html><title>Maintenance</title><body>temporarily unavailable</body></html>"))
+			return
+		}
 		var sb strings.Builder
-		sb.WriteString("<html><body>")
+		fmt.Fprintf(&sb, "<html><title>Index of %s</title><body><h1>Index of %s</h1>", p, p)
 		for _, c := range m.dirs[p] {
 			if strings.HasSuffix(c, "/") {
 				fmt.Fprintf(&sb, `<a href="%s/">%s/</a>`, strings.TrimSuffix(c, "/"), c)
@@ -288,6 +296,133 @@ func TestSyncFullStrictRebuildsCache(t *testing.T) {
 	}
 	if n := countRows(t, db, "SELECT COUNT(*) FROM full_inventory_runs"); n != 0 {
 		t.Fatalf("staging runs after GC = %d", n)
+	}
+}
+
+func TestSyncFullSkipsAbsentUncoveredRoots(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := newMirrorServer(t), newMirrorServer(t)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, strictManifest)
+		m.addFile("/电影/a.nfo", "AAA", `"ea"`)
+		m.addFile("/电影/sub/b.nfo", "BBBB", `"eb"`)
+		m.failPaths["/115"] = http.StatusNotFound
+		m.failPaths["/115/"] = http.StatusNotFound
+	}
+
+	mc := fullCrawlerOver(dir, m1, m2)
+	if err := mc.SyncFull(context.Background(), fullModeStrict, 1); err != nil {
+		t.Fatalf("strict full with absent optional root failed: %v", err)
+	}
+
+	db := openTestDB(t, dir)
+	if n := countRows(t, db, "SELECT COUNT(*) FROM files"); n != 2 {
+		t.Fatalf("files count = %d, want 2 manifest entries", n)
+	}
+	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path LIKE '/115/%'"); n != 0 {
+		t.Fatalf("absent optional root produced %d rows", n)
+	}
+}
+
+func TestSyncFullRejectsPartialUncoveredRoot(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.addDir("/115/", "a.nfo", "sub/")
+		m.addFile("/115/a.nfo", "A", `"ea115"`)
+		m.failPaths["/115/sub/"] = http.StatusNotFound
+	}
+
+	stale := filepath.Join(dir, "电影", "stale.nfo")
+	if err := os.MkdirAll(filepath.Dir(stale), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("old"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	mc := fullCrawlerOver(dir, m1, m2)
+	err := mc.SyncFull(context.Background(), fullModeStrict, 1)
+	if err == nil {
+		t.Fatal("partial uncovered root unexpectedly became authoritative")
+	}
+	if _, statErr := os.Stat(stale); statErr != nil {
+		t.Fatalf("strict full touched live files before inventory completed: %v", statErr)
+	}
+	db := openTestDB(t, dir)
+	st, stateErr := readFullSyncStateDB(context.Background(), db)
+	if stateErr != nil || st != nil {
+		t.Fatalf("partial inventory wrote full-sync state: %+v err=%v", st, stateErr)
+	}
+}
+
+func TestSyncFullRejectsGenericHTMLAsEmptyRoot(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.invalidHTML["/115/"] = true
+	}
+
+	mc := fullCrawlerOver(dir, m1, m2)
+	err := mc.SyncFull(context.Background(), fullModeStrict, 1)
+	if err == nil {
+		t.Fatal("generic HTML page unexpectedly became an authoritative empty root")
+	}
+	db := openTestDB(t, dir)
+	st, stateErr := readFullSyncStateDB(context.Background(), db)
+	if stateErr != nil || st != nil {
+		t.Fatalf("invalid HTML inventory wrote full-sync state: %+v err=%v", st, stateErr)
+	}
+}
+
+func TestIncrementalSameManifestRepairsMissingCacheFile(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m := newMirrorServer(t)
+	m.setManifest(t, "2024-01-02 03:04 /电影/a.nfo\n")
+	m.addFile("/电影/a.nfo", "AAA", `"ea"`)
+
+	mc := newFullCrawler(dir, []string{m.URL}, []string{m.URL}, 1)
+	mc.selectedPaths = []string{"/电影"}
+	if err := mc.Sync(context.Background()); err != nil {
+		t.Fatalf("first incremental sync failed: %v", err)
+	}
+	before := m.gets("/电影/a.nfo")
+	manifestBefore := m.gets(scanListPath)
+	cachePath := filepath.Join(dir, rootRel("/电影/a.nfo"))
+	if err := os.Remove(cachePath); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openMetadataDB(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setMeta(context.Background(), db, metaIntegrityCursor, "9223372036854775807"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mc.Sync(context.Background()); err != nil {
+		t.Fatalf("second incremental sync failed: %v", err)
+	}
+	got, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("missing cache file was not repaired: %v", err)
+	}
+	if string(got) != "AAA" {
+		t.Fatalf("repaired content = %q", got)
+	}
+	if m.gets("/电影/a.nfo") <= before {
+		t.Fatal("unchanged manifest did not trigger the targeted re-download")
+	}
+	if m.gets(scanListPath) <= manifestBefore {
+		t.Fatal("incremental trigger did not fetch the unchanged manifest")
 	}
 }
 

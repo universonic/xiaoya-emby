@@ -393,12 +393,22 @@ func (mc *MetadataCrawler) buildInventory(ctx context.Context, db *sql.DB, force
 }
 
 // dualCrawlRoot walks one root completely and independently on two pinned
-// mirrors and returns the union. A failure on any directory of either
-// source fails the root, so the result can never be a blend of mirrors.
+// mirrors and returns the union. A missing or empty root contributes an
+// empty set: optional roots are not published by every metadata mirror and
+// must not prevent the manifest-backed portion of a full rebuild. Once the
+// root is confirmed to exist, errors below it still fail closed so a partial
+// traversal can never become authoritative.
 func (mc *MetadataCrawler) dualCrawlRoot(ctx context.Context, first, second, root string, emit func(string) error) (int, error) {
 	walkOne := func(mirror string) (int, error) {
+		info, err := mc.StatPinned(ctx, mirror, root)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, nil
+			}
+			return 0, fmt.Errorf("pinned crawl of %s via %s failed: %w", root, sanitizeURL(mirror), err)
+		}
 		found := 0
-		err := mc.walkPinned(ctx, mirror, root, func(p string, info os.FileInfo, err error) error {
+		err = mc.walkPinnedRec(ctx, mirror, root, info, func(p string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
@@ -413,9 +423,6 @@ func (mc *MetadataCrawler) dualCrawlRoot(ctx context.Context, first, second, roo
 		})
 		if err != nil {
 			return 0, fmt.Errorf("pinned crawl of %s via %s failed: %w", root, sanitizeURL(mirror), err)
-		}
-		if found == 0 {
-			return 0, fmt.Errorf("pinned crawl of %s via %s returned no files", root, sanitizeURL(mirror))
 		}
 		return found, nil
 	}
@@ -916,12 +923,20 @@ func (mc *MetadataCrawler) relaxedEntry(ctx context.Context, e invEntry, files c
 			}
 			if mt := f.ModTime(); mc.fsRoot != nil {
 				if err := mc.fsRoot.Chtimes(rootRel(e.path), mt, mt); err != nil {
-					slog.Warn("Failed to set file modification time", "path", e.path, "error", err)
+					if os.IsNotExist(err) {
+						slog.Warn("Local file disappeared during full rebuild reuse check; downloading it", "path", e.path)
+					} else {
+						slog.Warn("Failed to set file modification time", "path", e.path, "error", err)
+						files <- f
+						globalStatus.incReused()
+						return nil
+					}
+				} else {
+					files <- f
+					globalStatus.incReused()
+					return nil
 				}
 			}
-			files <- f
-			globalStatus.incReused()
-			return nil
 		}
 	}
 	file, err := mc.Download(ctx, e.path, downloadOpts{
