@@ -16,6 +16,7 @@ import (
 
 // Sync phases reported by the status page.
 const (
+	PhaseStarting      = "starting"
 	PhaseProbing       = "probing"
 	PhaseManifest      = "downloading-manifest"
 	PhaseParsing       = "parsing-manifest"
@@ -229,16 +230,34 @@ func (s *syncStatus) setSyncType(syncType string) {
 	s.syncType = syncType
 }
 
-// setJob marks a round as running with its identity.
-func (s *syncStatus) setJob(syncType, trigger, effectiveMode, jobID string) {
+// startJob publishes the complete initial job snapshot in one critical
+// section, so status readers cannot observe a new running job with the
+// previous round's phase or download counters.
+func (s *syncStatus) startJob(trigger, effectiveMode, jobID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.syncType = syncType
+	now := time.Now()
+	s.syncType = effectiveMode
 	s.triggerSource = trigger
 	s.effectiveMode = effectiveMode
 	s.jobID = jobID
 	s.running = true
 	s.cancelRequested = false
+	s.phase = PhaseStarting
+	s.phaseStarted = now
+	s.roundStarted = now
+	s.roundDownload = 0
+	s.roundReused = 0
+	s.roundDeleted = 0
+	s.manifestShortCircuit = false
+	s.downloadTotal = 0
+	s.downloadPlanned = 0
+	s.downloadDownloaded = 0
+	s.downloadReused = 0
+	s.downloadFailed = 0
+	s.downloadRetryRound = 0
+	s.cleanupDeleted = 0
+	s.cleanupGuardTriggered = false
 }
 
 func (s *syncStatus) clearJob() {

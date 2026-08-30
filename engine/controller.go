@@ -337,9 +337,7 @@ func (c *Controller) launchJob(requested, effective, trigger string, settings Sy
 	}
 	c.current = j
 	c.busy.Store(true)
-	globalStatus.setJob(requested, trigger, effective, j.ID)
-	globalStatus.setSyncType(effective)
-	globalStatus.roundStart()
+	globalStatus.startJob(trigger, effective, j.ID)
 	slog.Info("Sync job started", "job", j.ID, "trigger", trigger, "requested", requested, "effective", effective)
 	go func() {
 		defer c.maintenanceMu.Unlock()

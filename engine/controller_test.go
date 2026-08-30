@@ -198,6 +198,51 @@ func TestControllerBusyReturnsConflict(t *testing.T) {
 	}
 }
 
+func TestControllerTriggerPublishesStartingStatusAtomically(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	store := NewSettingsStore(validSettings(), dir)
+	ctrl := NewController(&Config{DownloadDir: dir}, store)
+	manualStarted := make(chan struct{})
+	releaseManual := make(chan struct{})
+	ctrl.runRound = func(ctx context.Context, s SyncSettings, requested, trigger string, revision int64) (string, error) {
+		if trigger == TriggerManual {
+			close(manualStarted)
+			<-releaseManual
+		}
+		return OutcomeSuccess, nil
+	}
+	ctrl.Start()
+	defer ctrl.Stop()
+	waitForControllerIdle(t, ctrl)
+
+	// Seed values from the previous idle round. Trigger must replace all of
+	// them before making the new job visible as running.
+	globalStatus.setPhase(PhaseSleeping)
+	globalStatus.setDownloadPlan(10, 4)
+	if _, effective, err := ctrl.Trigger(SyncTypeFullRelaxed, false); err != nil {
+		t.Fatal(err)
+	} else if effective != SyncTypeFullRelaxed {
+		t.Fatalf("effective mode = %q, want %q", effective, SyncTypeFullRelaxed)
+	}
+	select {
+	case <-manualStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("manual round did not start")
+	}
+
+	snap := globalStatus.snapshot()
+	if !snap.Running || snap.Phase != PhaseStarting {
+		t.Fatalf("initial job status = running:%v phase:%q", snap.Running, snap.Phase)
+	}
+	if snap.SyncType != SyncTypeFullRelaxed || snap.Download.Total != 0 || snap.Download.Planned != 0 {
+		t.Fatalf("initial job snapshot retained previous round state: %+v", snap)
+	}
+
+	close(releaseManual)
+	waitFor(t, 5*time.Second, func() bool { return !globalStatus.snapshot().Running })
+}
+
 func TestControllerTriggerValidations(t *testing.T) {
 	resetGlobalStatus()
 	dir := t.TempDir()

@@ -273,7 +273,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const PHASES = {
-  "probing": "探测镜像", "downloading-manifest": "下载清单", "parsing-manifest": "解析清单",
+  "starting": "启动同步", "probing": "探测镜像", "downloading-manifest": "下载清单", "parsing-manifest": "解析清单",
   "inventory": "构建全量清单", "clearing-cache": "清空下载缓存", "downloading": "下载元数据",
   "rebuilding-index": "重建索引/复用", "comparing": "校验 strm/Alist", "preparing": "生成更新计划",
   "copying": "同步到媒体库", "cleanup": "清理过期文件", "sleeping": "休眠等待下次调度",
@@ -287,9 +287,10 @@ const OUTCOMES = {
 const MIRROR_STATES = {
   "fresh": ["最新", "ok"], "stale": ["清单过期", "warn"], "crawl-only": ["仅爬取", ""], "invalid": ["失效", "err"],
 };
-const INDET_PHASES = new Set(["probing", "downloading-manifest", "parsing-manifest", "inventory", "clearing-cache", "cleanup"]);
+const INDET_PHASES = new Set(["starting", "probing", "downloading-manifest", "parsing-manifest", "inventory", "clearing-cache", "cleanup"]);
 let lastSeq = 0, lastUpdated = null, cached = [];
 let cfgRevision = null;
+let statusRequestSeq = 0;
 
 const state = {
   get token() { return sessionStorage.getItem("xiaoya-token") || ""; },
@@ -333,6 +334,7 @@ async function triggerSync(mode, confirm) {
     const eff = resp.payload.effective_mode;
     const note = eff && eff !== mode ? `；所选模式被未完成的全量恢复覆盖为「${SYNC_TYPES[eff] || eff}」` : "";
     opsMsg(`已接受任务 ${resp.payload.job_id}${note}`, "ok");
+    await pollStatus();
     return;
   }
   if (resp.payload && resp.payload.error && resp.payload.error.code === "confirm_required") {
@@ -495,15 +497,17 @@ function renderOps(st) {
 }
 
 async function pollStatus() {
+  const requestSeq = ++statusRequestSeq;
   let st;
   try {
     const r = await fetch("/api/status", { cache: "no-store" });
     st = await r.json();
-    lastUpdated = new Date();
   } catch {
-    $("stale").textContent = "无法连接服务";
+    if (requestSeq === statusRequestSeq) $("stale").textContent = "无法连接服务";
     return;
   }
+  if (requestSeq !== statusRequestSeq) return;
+  lastUpdated = new Date();
   $("stale").textContent = "更新于 " + lastUpdated.toLocaleTimeString("zh-CN", { hour12: false });
 
   $("version").textContent = st.version || "-";
@@ -518,9 +522,21 @@ async function pollStatus() {
   renderOps(st);
 
   const d = st.download, planned = Math.max(d.planned, d.downloaded + d.failed + d.reused);
+  const latest = !st.running && st.history && st.history.length ? st.history[0] : null;
   const bar = $("bar"), track = bar.parentElement;
   let trackCls = "progress", fillCls = "fill", label = "-", width = 0;
-  if (INDET_PHASES.has(st.phase)) {
+  if (latest && latest.outcome && latest.outcome !== "success") {
+    if (latest.outcome === "deferred") {
+      fillCls += " warn";
+      label = "本轮等待同步条件，请查看历史或日志";
+    } else if (latest.outcome === "canceled") {
+      fillCls += " warn";
+      label = "本轮同步已中止";
+    } else {
+      fillCls += " warn";
+      label = "本轮同步失败，请查看历史或日志";
+    }
+  } else if (INDET_PHASES.has(st.phase)) {
     trackCls = "progress indeterminate";
     label = (PHASES[st.phase] || st.phase) + "…";
   } else {
