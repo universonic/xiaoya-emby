@@ -807,7 +807,7 @@ func copyFile(ctx context.Context, tx *sql.Tx, file *MetadataFile, toRoot, fromR
 		toRoot.Remove(tmp)
 		return fmt.Errorf("copied %s: wrote %d bytes, source row records %d", rel, n, size)
 	}
-	if err := toRoot.Rename(tmp, rel); err != nil {
+	if err := renameReplaceFile(toRoot, tmp, rel); err != nil {
 		toRoot.Remove(tmp)
 		return err
 	}

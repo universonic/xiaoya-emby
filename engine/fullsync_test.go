@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -95,6 +97,9 @@ func (m *mirrorTestServer) handle(w http.ResponseWriter, r *http.Request) {
 	defer m.mu.Unlock()
 	p := r.URL.Path
 	if code, ok := m.failPaths[p]; ok {
+		if r.Method == "GET" {
+			m.getCount[p]++
+		}
 		w.WriteHeader(code)
 		return
 	}
@@ -480,6 +485,127 @@ func TestSyncFullRelaxedReuseHeuristics(t *testing.T) {
 	snap := globalStatus.snapshot()
 	if snap.Download.Reused != 1 {
 		t.Fatalf("reused counter = %d", snap.Download.Reused)
+	}
+}
+
+func TestSyncFullRelaxedReplacesExistingDirectoryWithFile(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	conflict := filepath.Join(dir, rootRel("/电影/a.nfo"))
+	if err := os.MkdirAll(conflict, dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(conflict, "stale"), []byte("old"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	mc := fullCrawlerOver(dir, m1, m2)
+	if err := mc.SyncFull(context.Background(), fullModeRelaxed, 1); err != nil {
+		t.Fatalf("relaxed full failed to replace existing target: %v", err)
+	}
+	got, err := os.ReadFile(conflict)
+	if err != nil || string(got) != "AAA" {
+		t.Fatalf("replacement content = %q, err = %v", got, err)
+	}
+}
+
+func TestRenameConflictRecognizesLinuxFileOverDirectoryError(t *testing.T) {
+	if !isRenameConflict(&os.LinkError{Op: "rename", Old: "old", New: "new", Err: syscall.EISDIR}) {
+		t.Fatal("EISDIR must trigger the existing-target replacement path")
+	}
+}
+
+func TestIncrementalUnanimous404IsSkippedOnlyForCurrentRound(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := newMirrorServer(t), newMirrorServer(t)
+	const (
+		filePath  = "/电影/gone.nfo"
+		flakyPath = "/电影/flaky.nfo"
+	)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, "2024-01-02 03:04 "+filePath+"\n2024-01-02 03:04 "+flakyPath+"\n")
+		m.addFile(filePath, "old", `"gone"`)
+		m.addFile(flakyPath, "good", `"flaky"`)
+	}
+	mc := newFullCrawler(dir, []string{m1.URL, m2.URL}, []string{m1.URL, m2.URL}, 2)
+	mc.selectedPaths = []string{"/电影"}
+	if err := mc.Sync(context.Background()); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, "2024-01-02 03:05 "+filePath+"\n2024-01-02 03:05 "+flakyPath+"\n")
+		m.mu.Lock()
+		delete(m.files, filePath)
+		m.failPaths[filePath] = http.StatusNotFound
+		m.mu.Unlock()
+
+		// Fail this mirror's first flaky-file body without entering the
+		// request-level status retry. The next metadata retry succeeds.
+		inner := m.Server.Config.Handler
+		var requests atomic.Int32
+		m.Server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == flakyPath && requests.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", "5")
+				_, _ = w.Write([]byte("bad"))
+				return
+			}
+			inner.ServeHTTP(w, r)
+		})
+	}
+	before1, before2 := m1.gets(filePath), m2.gets(filePath)
+	done := make(chan error, 1)
+	go func() { done <- mc.Sync(context.Background()) }()
+
+	// The 404 entry must be removed after the first batch, while the flaky
+	// entry is still pending its two-second metadata retry delay.
+	cachePath := filepath.Join(dir, rootRel(filePath))
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, err := os.Stat(cachePath)
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("cannot inspect unavailable cache file: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unavailable cache file was not removed before another entry's retry")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 1 {
+		t.Fatalf("first batch counters = %+v, want unavailable=1 failed=1", snap.Download)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("404 round failed: %v", err)
+	}
+	if got := m1.gets(filePath) - before1; got != 1 {
+		t.Fatalf("first mirror requests in one trigger = %d, want 1", got)
+	}
+	if got := m2.gets(filePath) - before2; got != 1 {
+		t.Fatalf("second mirror requests in one trigger = %d, want 1", got)
+	}
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("unavailable cache file still exists: %v", err)
+	}
+	db := openTestDB(t, dir)
+	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path = ?", filePath); n != 0 {
+		t.Fatalf("unavailable row count = %d, want 0", n)
+	}
+	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 0 {
+		t.Fatalf("completed retry counters = %+v, want unavailable=1 failed=0", snap.Download)
+	}
+
+	before1, before2 = m1.gets(filePath), m2.gets(filePath)
+	if err := mc.Sync(context.Background()); err != nil {
+		t.Fatalf("next incremental trigger failed: %v", err)
+	}
+	if m1.gets(filePath)-before1 != 1 || m2.gets(filePath)-before2 != 1 {
+		t.Fatal("next incremental trigger did not retry the unavailable entry")
 	}
 }
 

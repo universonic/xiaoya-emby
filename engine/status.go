@@ -139,12 +139,13 @@ type statusSnapshot struct {
 	} `json:"manifest"`
 
 	Download struct {
-		Total      int `json:"total"`
-		Planned    int `json:"planned"`
-		Downloaded int `json:"downloaded"`
-		Reused     int `json:"reused"`
-		Failed     int `json:"failed"`
-		RetryRound int `json:"retry_round"`
+		Total       int `json:"total"`
+		Planned     int `json:"planned"`
+		Downloaded  int `json:"downloaded"`
+		Reused      int `json:"reused"`
+		Unavailable int `json:"unavailable"`
+		Failed      int `json:"failed"`
+		RetryRound  int `json:"retry_round"`
 	} `json:"download"`
 
 	Cleanup struct {
@@ -191,12 +192,13 @@ type syncStatus struct {
 	manifestEntries      int
 	manifestShortCircuit bool
 
-	downloadTotal      int
-	downloadPlanned    int
-	downloadDownloaded int
-	downloadReused     int
-	downloadFailed     int
-	downloadRetryRound int
+	downloadTotal       int
+	downloadPlanned     int
+	downloadDownloaded  int
+	downloadReused      int
+	downloadUnavailable int
+	downloadFailed      int
+	downloadRetryRound  int
 
 	cleanupEnabled        bool
 	cleanupDeleted        int
@@ -254,6 +256,7 @@ func (s *syncStatus) startJob(trigger, effectiveMode, jobID string) {
 	s.downloadPlanned = 0
 	s.downloadDownloaded = 0
 	s.downloadReused = 0
+	s.downloadUnavailable = 0
 	s.downloadFailed = 0
 	s.downloadRetryRound = 0
 	s.cleanupDeleted = 0
@@ -315,6 +318,7 @@ func (s *syncStatus) roundStart() {
 	s.downloadPlanned = 0
 	s.downloadDownloaded = 0
 	s.downloadReused = 0
+	s.downloadUnavailable = 0
 	s.downloadFailed = 0
 	s.downloadRetryRound = 0
 	s.cleanupDeleted = 0
@@ -389,6 +393,7 @@ func (s *syncStatus) setDownloadPlan(total, planned int) {
 	s.downloadPlanned = planned
 	s.downloadDownloaded = 0
 	s.downloadReused = 0
+	s.downloadUnavailable = 0
 	s.downloadFailed = 0
 	s.downloadRetryRound = 0
 }
@@ -407,10 +412,22 @@ func (s *syncStatus) incReused() {
 	s.roundReused++
 }
 
+func (s *syncStatus) incUnavailable() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.downloadUnavailable++
+}
+
 func (s *syncStatus) incFailed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.downloadFailed++
+}
+
+func (s *syncStatus) setFailed(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.downloadFailed = n
 }
 
 func (s *syncStatus) setRetryRound(n int) {
@@ -476,6 +493,7 @@ func (s *syncStatus) snapshot() statusSnapshot {
 	snap.Download.Planned = s.downloadPlanned
 	snap.Download.Downloaded = s.downloadDownloaded
 	snap.Download.Reused = s.downloadReused
+	snap.Download.Unavailable = s.downloadUnavailable
 	snap.Download.Failed = s.downloadFailed
 	snap.Download.RetryRound = s.downloadRetryRound
 	snap.Cleanup.Enabled = s.cleanupEnabled

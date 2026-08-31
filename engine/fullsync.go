@@ -1037,7 +1037,7 @@ func (mc *MetadataCrawler) finalizeFull(ctx context.Context, db *sql.DB, st *ful
 				if err := mc.fsRoot.MkdirAll(filepath.Dir(trashPath), dirPerm); err != nil {
 					return err
 				}
-				if err := mc.fsRoot.Rename(fp, trashPath); err != nil {
+				if err := renameReplaceCachePath(mc.fsRoot, fp, trashPath); err != nil {
 					if !os.IsNotExist(err) {
 						return err
 					}

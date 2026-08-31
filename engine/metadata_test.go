@@ -323,3 +323,31 @@ func TestTempPathForAndSweep(t *testing.T) {
 		t.Fatal("plain .tmp name must not be treated as our temp file")
 	}
 }
+
+func TestRenameReplaceFileDoesNotRemoveDirectory(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := root.WriteFile("source.tmp", []byte("new"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.MkdirAll("target", dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.WriteFile(filepath.Join("target", "media"), []byte("keep"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := renameReplaceFile(root, "source.tmp", "target"); err == nil {
+		t.Fatal("media-safe replacement unexpectedly removed a directory")
+	}
+	if got, err := root.ReadFile(filepath.Join("target", "media")); err != nil || string(got) != "keep" {
+		t.Fatalf("media directory was changed: %q, %v", got, err)
+	}
+	if _, err := root.Stat("source.tmp"); err != nil {
+		t.Fatalf("source temp file was removed after rejected replacement: %v", err)
+	}
+}

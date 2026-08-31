@@ -82,6 +82,7 @@ func TestStatusSnapshotLifecycle(t *testing.T) {
 	s.setDownloadPlan(700390, 4)
 	s.incDownloaded()
 	s.incDownloaded()
+	s.incUnavailable()
 	s.incFailed()
 	s.setRetryRound(1)
 	s.setCleanupEnabled(true)
@@ -96,7 +97,7 @@ func TestStatusSnapshotLifecycle(t *testing.T) {
 	if snap.Mode != ModeManifest || snap.Phase != PhaseDownloading {
 		t.Fatalf("mode/phase = %s/%s", snap.Mode, snap.Phase)
 	}
-	if snap.Download.Planned != 4 || snap.Download.Downloaded != 2 || snap.Download.Failed != 1 || snap.Download.RetryRound != 1 {
+	if snap.Download.Planned != 4 || snap.Download.Downloaded != 2 || snap.Download.Unavailable != 1 || snap.Download.Failed != 1 || snap.Download.RetryRound != 1 {
 		t.Fatalf("download counters wrong: %+v", snap.Download)
 	}
 	if snap.Cleanup.Deleted != 3 || !snap.Cleanup.GuardTriggered {
@@ -179,6 +180,10 @@ func TestStatusHTTPHandlers(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(body.String(), "同步状态") {
 		t.Fatal("index page content missing")
+	}
+	if !strings.Contains(body.String(), "const showProgress = st.running && planned > 0") ||
+		!strings.Contains(body.String(), "st.running && !showProgress && INDET_PHASES.has(st.phase)") {
+		t.Fatal("status page no longer prioritizes an active download plan over indeterminate phases")
 	}
 
 	resp, err = http.Get(srv.URL + "/nope")

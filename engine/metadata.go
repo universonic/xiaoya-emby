@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -619,14 +620,17 @@ func (mc *MetadataCrawler) reconcileTrash(ctx context.Context, db *sql.DB, pendi
 		case err == nil:
 			if _, statErr := mc.fsRoot.Stat(rel); statErr == nil {
 				// A newer copy already exists at the original path.
-				return mc.fsRoot.Remove(name)
+				if err := mc.fsRoot.Remove(name); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				return nil
 			} else if !os.IsNotExist(statErr) {
 				return statErr
 			}
 			if err := mc.fsRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil {
 				return err
 			}
-			if err := mc.fsRoot.Rename(name, rel); err != nil {
+			if err := renameReplaceCachePath(mc.fsRoot, name, rel); err != nil {
 				return err
 			}
 			slog.Warn("Restored file from interrupted cleanup", "path", remotePath)
@@ -668,6 +672,66 @@ func tempPathFor(filePath string) string {
 	return fmt.Sprintf("%s%s%d-%d.tmp", filePath, ownTempInfix, os.Getpid(), ownTempSeq.Add(1))
 }
 
+func isRenameConflict(err error) bool {
+	return os.IsExist(err) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTEMPTY)
+}
+
+// renameReplaceRoot installs oldname at newname. recursive is only for the
+// disposable download cache; media paths must never recursively remove a
+// directory merely because it conflicts with a metadata file.
+func renameReplaceRoot(root *os.Root, oldname, newname string, recursive bool) error {
+	err := root.Rename(oldname, newname)
+	if err == nil || !isRenameConflict(err) {
+		return err
+	}
+	info, statErr := root.Lstat(newname)
+	if statErr != nil {
+		return err
+	}
+	if info.IsDir() && !recursive {
+		return err
+	}
+	if recursive {
+		statErr = root.RemoveAll(newname)
+	} else {
+		statErr = root.Remove(newname)
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return statErr
+	}
+	return root.Rename(oldname, newname)
+}
+
+func renameReplaceCachePath(root *os.Root, oldname, newname string) error {
+	return renameReplaceRoot(root, oldname, newname, true)
+}
+
+func renameReplaceFile(root *os.Root, oldname, newname string) error {
+	return renameReplaceRoot(root, oldname, newname, false)
+}
+
+func removeManifestUnavailable(ctx context.Context, mc *MetadataCrawler, db *sql.DB, localMap map[string]*MetadataFile, entries []manifestEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	var stale []*MetadataFile
+	for _, item := range entries {
+		if old := localMap[item.path]; old != nil {
+			stale = append(stale, old)
+		}
+	}
+	if len(stale) > 0 {
+		if err := quarantineAndDelete(ctx, mc.fsRoot, db, stale); err != nil {
+			return err
+		}
+		for _, old := range stale {
+			delete(localMap, old.Path())
+		}
+	}
+	slog.Warn("Manifest entries absent from all mirrors were skipped for this round", "count", len(entries), "removed", len(stale))
+	return nil
+}
+
 // writeFileAtomicRoot replaces rel below root via sibling temp file, close,
 // rename, so an interrupted write never leaves a partial file behind.
 func writeFileAtomicRoot(root *os.Root, rel string, data []byte, perm os.FileMode) error {
@@ -688,7 +752,7 @@ func writeFileAtomicRoot(root *os.Root, rel string, data []byte, perm os.FileMod
 	}
 	// The temp file must not survive a failed rename: this root is the
 	// media library, which sweepTempFiles does not cover.
-	if err := root.Rename(tmp, rel); err != nil {
+	if err := renameReplaceFile(root, tmp, rel); err != nil {
 		root.Remove(tmp)
 		return err
 	}
@@ -954,11 +1018,13 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 	}
 
 	// runRound downloads one round of entries with a fixed-size worker
-	// pool and returns the entries that should be retried.
-	runRound := func(list []manifestEntry) ([]manifestEntry, error) {
+	// pool and separates transient failures from entries confirmed absent
+	// on every mirror. Confirmed absences are terminal only for this trigger.
+	runRound := func(list []manifestEntry) ([]manifestEntry, []manifestEntry, error) {
 		var (
-			mux  sync.Mutex
-			next []manifestEntry
+			mux         sync.Mutex
+			next        []manifestEntry
+			unavailable []manifestEntry
 		)
 		files := make(chan *MetadataFile, mc.workerCount()*2)
 		writerDone := startMetadataFilesWriter(ctx, db, files)
@@ -991,14 +1057,17 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 					})
 					if derr != nil {
 						if errors.Is(derr, fs.ErrNotExist) {
-							slog.Error("Manifest entry missing on all mirrors", "path", item.path)
+							slog.Warn("Manifest entry is absent from all mirrors; skipping it for this round", "path", item.path)
+							globalStatus.incUnavailable()
+							mux.Lock()
+							unavailable = append(unavailable, item)
+							mux.Unlock()
 						} else {
 							slog.Error("Failed to download", "path", item.path, "error", derr)
+							mux.Lock()
+							next = append(next, item)
+							mux.Unlock()
 						}
-						globalStatus.incFailed()
-						mux.Lock()
-						next = append(next, item)
-						mux.Unlock()
 						continue
 					}
 					if file != nil {
@@ -1011,9 +1080,10 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 		wg.Wait()
 		close(files)
 		if err := <-writerDone; err != nil {
-			return next, err
+			return next, unavailable, err
 		}
-		return next, nil
+		globalStatus.setFailed(len(next))
+		return next, unavailable, nil
 	}
 
 	pending := toDownload
@@ -1030,9 +1100,13 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 			}
 		}
 		var roundErr error
-		pending, roundErr = runRound(pending)
+		var missing []manifestEntry
+		pending, missing, roundErr = runRound(pending)
 		if roundErr != nil {
 			return roundErr
+		}
+		if err := removeManifestUnavailable(ctx, mc, db, localMap, missing); err != nil {
+			return err
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -2079,7 +2153,7 @@ func (mc *MetadataCrawler) download(ctx context.Context, mirror, path string, o 
 			return nil, &fs.PathError{Op: "Get", Path: f.Path(), Err: fmt.Errorf("sync round exceeds download byte budget")}
 		}
 		f.size = written
-		if err := mc.fsRoot.Rename(tmpPath, filePath); err != nil {
+		if err := renameReplaceCachePath(mc.fsRoot, tmpPath, filePath); err != nil {
 			mc.fsRoot.Remove(tmpPath)
 			return nil, &fsError{err}
 		}
@@ -2692,7 +2766,7 @@ func quarantineAndDelete(ctx context.Context, root *os.Root, db *sql.DB, toDelet
 			slog.Warn("Failed to prepare quarantine for stale metadata file", "path", oldFile.Path(), "error", err)
 			continue
 		}
-		if err := root.Rename(fp, trashPath); err != nil {
+		if err := renameReplaceCachePath(root, fp, trashPath); err != nil {
 			if os.IsNotExist(err) {
 				// File already gone (e.g. after an interrupted earlier
 				// cleanup): the row can be deleted safely.
@@ -2728,7 +2802,7 @@ func quarantineAndDelete(ctx context.Context, root *os.Root, db *sql.DB, toDelet
 	// pruning empty parent directories. Failures here are harmless: the
 	// leftovers are swept on the next processing round.
 	for _, q := range renamed {
-		if err := root.Remove(q.trash); err != nil && !os.IsNotExist(err) {
+		if err := root.RemoveAll(q.trash); err != nil {
 			slog.Warn("Failed to remove quarantined file", "path", q.trash, "error", err)
 			continue
 		}
