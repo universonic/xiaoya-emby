@@ -516,9 +516,9 @@ func TestRenameConflictRecognizesLinuxFileOverDirectoryError(t *testing.T) {
 	}
 }
 
-func TestIncrementalUnanimous404IsSkippedOnlyForCurrentRound(t *testing.T) {
+func TestIncrementalUnanimous404DefersAndPreservesExistingState(t *testing.T) {
 	resetGlobalStatus()
-	dir := t.TempDir()
+	downloadDir, mediaDir := t.TempDir(), t.TempDir()
 	m1, m2 := newMirrorServer(t), newMirrorServer(t)
 	const (
 		filePath  = "/电影/gone.nfo"
@@ -529,10 +529,21 @@ func TestIncrementalUnanimous404IsSkippedOnlyForCurrentRound(t *testing.T) {
 		m.addFile(filePath, "old", `"gone"`)
 		m.addFile(flakyPath, "good", `"flaky"`)
 	}
-	mc := newFullCrawler(dir, []string{m1.URL, m2.URL}, []string{m1.URL, m2.URL}, 2)
-	mc.selectedPaths = []string{"/电影"}
-	if err := mc.Sync(context.Background()); err != nil {
+	cfg := &Config{DownloadDir: downloadDir, MediaDir: mediaDir}
+	settings := validSettings()
+	settings.RunMode = modeBitDownload | modeBitMedia
+	settings.Purge = false
+	settings.MirrorURL = []string{m1.URL, m2.URL}
+	settings.DownloadWorkers = 2
+	if err := cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0); err != nil {
 		t.Fatalf("initial sync failed: %v", err)
+	}
+	cachePath := filepath.Join(downloadDir, rootRel(filePath))
+	mediaPath := filepath.Join(mediaDir, rootRel(filePath))
+	for _, p := range []string{cachePath, mediaPath} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != "old" {
+			t.Fatalf("initial file %s = %q, err = %v", p, got, err)
+		}
 	}
 
 	for _, m := range []*mirrorTestServer{m1, m2} {
@@ -558,30 +569,27 @@ func TestIncrementalUnanimous404IsSkippedOnlyForCurrentRound(t *testing.T) {
 	}
 	before1, before2 := m1.gets(filePath), m2.gets(filePath)
 	done := make(chan error, 1)
-	go func() { done <- mc.Sync(context.Background()) }()
+	go func() { done <- cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0) }()
 
-	// The 404 entry must be removed after the first batch, while the flaky
-	// entry is still pending its two-second metadata retry delay.
-	cachePath := filepath.Join(dir, rootRel(filePath))
+	// Cached and media copies must remain present while the flaky entry is
+	// still pending its two-second metadata retry delay.
 	deadline := time.Now().Add(time.Second)
-	for {
-		_, err := os.Stat(cachePath)
-		if os.IsNotExist(err) {
-			break
-		}
-		if err != nil {
-			t.Fatalf("cannot inspect unavailable cache file: %v", err)
-		}
+	for globalStatus.snapshot().Download.Failed != 1 {
 		if time.Now().After(deadline) {
-			t.Fatal("unavailable cache file was not removed before another entry's retry")
+			t.Fatal("transient failure was not observed before its retry")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	for _, p := range []string{cachePath, mediaPath} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != "old" {
+			t.Fatalf("file changed during deferred round %s = %q, err = %v", p, got, err)
+		}
 	}
 	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 1 {
 		t.Fatalf("first batch counters = %+v, want unavailable=1 failed=1", snap.Download)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("404 round failed: %v", err)
+	if err := <-done; !isDeferredErr(err) {
+		t.Fatalf("404 round = %v, want deferred", err)
 	}
 	if got := m1.gets(filePath) - before1; got != 1 {
 		t.Fatalf("first mirror requests in one trigger = %d, want 1", got)
@@ -589,23 +597,36 @@ func TestIncrementalUnanimous404IsSkippedOnlyForCurrentRound(t *testing.T) {
 	if got := m2.gets(filePath) - before2; got != 1 {
 		t.Fatalf("second mirror requests in one trigger = %d, want 1", got)
 	}
-	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
-		t.Fatalf("unavailable cache file still exists: %v", err)
+	for _, p := range []string{cachePath, mediaPath} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != "old" {
+			t.Fatalf("deferred round did not preserve %s = %q, err = %v", p, got, err)
+		}
 	}
-	db := openTestDB(t, dir)
-	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path = ?", filePath); n != 0 {
-		t.Fatalf("unavailable row count = %d, want 0", n)
+	db := openTestDB(t, downloadDir)
+	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path = ?", filePath); n != 1 {
+		t.Fatalf("unavailable row count = %d, want 1", n)
 	}
 	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 0 {
 		t.Fatalf("completed retry counters = %+v, want unavailable=1 failed=0", snap.Download)
 	}
 
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.mu.Lock()
+		delete(m.failPaths, filePath)
+		m.files[filePath] = mirrorFile{content: "new", etag: `"gone-new"`, lastModified: testManifestLastModified}
+		m.mu.Unlock()
+	}
 	before1, before2 = m1.gets(filePath), m2.gets(filePath)
-	if err := mc.Sync(context.Background()); err != nil {
+	if err := cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0); err != nil {
 		t.Fatalf("next incremental trigger failed: %v", err)
 	}
-	if m1.gets(filePath)-before1 != 1 || m2.gets(filePath)-before2 != 1 {
+	if m1.gets(filePath)-before1+m2.gets(filePath)-before2 < 1 {
 		t.Fatal("next incremental trigger did not retry the unavailable entry")
+	}
+	for _, p := range []string{cachePath, mediaPath} {
+		if got, err := os.ReadFile(p); err != nil || string(got) != "new" {
+			t.Fatalf("recovered file %s = %q, err = %v", p, got, err)
+		}
 	}
 }
 

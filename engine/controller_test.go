@@ -92,51 +92,124 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Fatal("condition not met in time")
 }
 
-// TestRunSyncRoundRetryPolicy pins the trigger-based retry contract: a
-// non-daemon round fails once and returns (exit-code path), while a daemon
-// round keeps retrying until canceled.
+// TestRunSyncRoundRetryPolicy pins the trigger-based retry contract without
+// sleeping through production backoff intervals.
 func TestRunSyncRoundRetryPolicy(t *testing.T) {
-	resetGlobalStatus()
-	newCfg := func(daemon bool) (*Config, SyncSettings) {
-		cfg := &Config{DownloadDir: t.TempDir(), MediaDir: t.TempDir(), RunAsDaemon: daemon}
-		s := SyncSettings{
-			RunMode:   4, // download only; the unreachable mirror fails the phase
-			RunCron:   "0 0 * * *",
-			AlistURL:  "http://xiaoya.host:5678/",
-			MirrorURL: []string{"http://127.0.0.1:1/"},
+	permanent := errors.New("permanent")
+	attempts := 0
+	err := retryRound(context.Background(), true, 0, func() error {
+		attempts++
+		return permanent
+	})
+	if !errors.Is(err, permanent) || attempts != 1+maxAutomaticRoundRetries {
+		t.Fatalf("automatic permanent failure = %v after %d attempts", err, attempts)
+	}
+
+	attempts = 0
+	err = retryRound(context.Background(), true, 0, func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("temporary")
 		}
-		return cfg, s
+		return nil
+	})
+	if err != nil || attempts != 3 {
+		t.Fatalf("automatic recovery = %v after %d attempts", err, attempts)
 	}
 
-	// Non-daemon: one attempt, immediate failure (no 5s retry sleep).
-	cfg, s := newCfg(false)
-	start := time.Now()
-	outcome, err := cfg.runSyncRound(context.Background(), s, SyncTypeIncremental, TriggerStartup, 0)
-	if err == nil || outcome != OutcomeFailed {
-		t.Fatalf("non-daemon round = %s/%v", outcome, err)
+	for name, automaticErr := range map[string]error{
+		"manual":   permanent,
+		"deferred": errManifestPending,
+	} {
+		t.Run(name, func(t *testing.T) {
+			attempts := 0
+			err := retryRound(context.Background(), name != "manual", 0, func() error {
+				attempts++
+				return automaticErr
+			})
+			if !errors.Is(err, automaticErr) || attempts != 1 {
+				t.Fatalf("%s failure = %v after %d attempts", name, err, attempts)
+			}
+		})
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("non-daemon round retried for %v", elapsed)
-	}
+}
 
-	// Daemon: a pending-state probe error also enters the same retry
-	// policy. Make downloadDir a regular file so probing fails before the
-	// download phase, then cancel after the first retry sleep.
-	cfg, s = newCfg(true)
-	badDownloadDir := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(badDownloadDir, []byte("x"), filePerm); err != nil {
-		t.Fatal(err)
+func TestControllerFailedAutomaticRoundSchedulesNextRun(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	ctrl := NewController(&Config{DownloadDir: dir}, NewSettingsStore(validSettings(), dir))
+	wantNext := time.Now().Add(time.Hour)
+	ctrl.nextCronTime = func(expr string, now time.Time) (time.Time, error) { return wantNext, nil }
+	var attempts atomic.Int64
+	ctrl.runRound = func(ctx context.Context, s SyncSettings, requested, trigger string, revision int64) (string, error) {
+		err := retryRound(ctx, true, 0, func() error {
+			attempts.Add(1)
+			return errors.New("permanent")
+		})
+		return OutcomeFailed, err
 	}
-	cfg.DownloadDir = badDownloadDir
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(5500 * time.Millisecond)
-		cancel()
-	}()
-	outcome, _ = cfg.runSyncRound(ctx, s, SyncTypeIncremental, TriggerStartup, 0)
-	if outcome != OutcomeCanceled {
-		t.Fatalf("daemon round = %s, want canceled (still retrying)", outcome)
+	ctrl.Start()
+	defer ctrl.Stop()
+	waitForControllerIdle(t, ctrl)
+
+	snap := globalStatus.snapshot()
+	if attempts.Load() != 1+maxAutomaticRoundRetries {
+		t.Fatalf("attempts = %d, want %d", attempts.Load(), 1+maxAutomaticRoundRetries)
 	}
+	if len(snap.History) != 1 || snap.History[0].Outcome != OutcomeFailed {
+		t.Fatalf("history = %+v, want one failed round", snap.History)
+	}
+	if snap.NextRunAt == nil || !snap.NextRunAt.Equal(wantNext) {
+		t.Fatalf("next_run_at = %v, want %v", snap.NextRunAt, wantNext)
+	}
+}
+
+func TestRunSyncRoundReportsMediaPhases(t *testing.T) {
+	t.Run("comparing", func(t *testing.T) {
+		resetGlobalStatus()
+		downloadDir := t.TempDir()
+		db := openTestDB(t, downloadDir)
+		if err := createFileTable(context.Background(), db); err != nil {
+			t.Fatal(err)
+		}
+		path := "/电影/bad.strm"
+		if err := insertTestRow(context.Background(), db, &MetadataFile{path: path, name: "bad.strm"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(downloadDir, rootRel(path)), dirPerm); err != nil {
+			t.Fatal(err)
+		}
+		s := validSettings()
+		s.RunMode, s.Purge = modeBitMedia, false
+		err := (&Config{DownloadDir: downloadDir, MediaDir: t.TempDir()}).runSyncRoundOnce(context.Background(), s, SyncTypeIncremental, 0)
+		if err == nil || globalStatus.snapshot().Phase != PhaseComparing {
+			t.Fatalf("compare failure = %v, phase = %q", err, globalStatus.snapshot().Phase)
+		}
+	})
+
+	t.Run("preparing", func(t *testing.T) {
+		resetGlobalStatus()
+		mediaPath := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(mediaPath, []byte("x"), filePerm); err != nil {
+			t.Fatal(err)
+		}
+		s := validSettings()
+		s.RunMode, s.Purge = modeBitMedia, false
+		err := (&Config{DownloadDir: t.TempDir(), MediaDir: mediaPath}).runSyncRoundOnce(context.Background(), s, SyncTypeIncremental, 0)
+		if err == nil || globalStatus.snapshot().Phase != PhasePreparing {
+			t.Fatalf("prepare failure = %v, phase = %q", err, globalStatus.snapshot().Phase)
+		}
+	})
+
+	t.Run("copying", func(t *testing.T) {
+		resetGlobalStatus()
+		s := validSettings()
+		s.RunMode, s.Purge = modeBitMedia, false
+		err := (&Config{DownloadDir: t.TempDir(), MediaDir: t.TempDir()}).runSyncRoundOnce(context.Background(), s, SyncTypeIncremental, 0)
+		if err != nil || globalStatus.snapshot().Phase != PhaseCopying {
+			t.Fatalf("copy phase = %v/%q", err, globalStatus.snapshot().Phase)
+		}
+	})
 }
 
 func TestControllerStartupRunsImmediatelyAndCronSchedules(t *testing.T) {
@@ -195,6 +268,85 @@ func TestControllerBusyReturnsConflict(t *testing.T) {
 	_, _, err = h.ctrl.Abort()
 	if err == nil {
 		t.Fatal("abort without an active job succeeded")
+	}
+}
+
+func TestControllerStopCancelsAndWaitsForActiveRound(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	ctrl := NewController(&Config{DownloadDir: dir}, NewSettingsStore(validSettings(), dir))
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	ctrl.runRound = func(ctx context.Context, s SyncSettings, requested, trigger string, revision int64) (string, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		return OutcomeCanceled, ctx.Err()
+	}
+	ctrl.Start()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup round did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		ctrl.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not cancel the active round")
+	}
+	if _, _, err := ctrl.Trigger(SyncTypeIncremental, false); !errors.Is(err, errControlUnavailable) {
+		t.Fatalf("trigger during shutdown = %v, want errControlUnavailable", err)
+	}
+	if _, _, err := ctrl.Abort(); !errors.Is(err, errControlUnavailable) {
+		t.Fatalf("abort during shutdown = %v, want errControlUnavailable", err)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned before the active round exited")
+	default:
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after the active round exited")
+	}
+}
+
+func TestControllerStopCannotCrossBlockedJobLaunch(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	ctrl := NewController(&Config{DownloadDir: dir}, NewSettingsStore(validSettings(), dir))
+	ctrl.maintenanceMu.Lock()
+	var started atomic.Int64
+	ctrl.runRound = func(ctx context.Context, s SyncSettings, requested, trigger string, revision int64) (string, error) {
+		started.Add(1)
+		return OutcomeSuccess, nil
+	}
+	ctrl.Start()
+
+	stopped := make(chan struct{})
+	go func() {
+		ctrl.Stop()
+		close(stopped)
+	}()
+	waitFor(t, 5*time.Second, ctrl.stopping.Load)
+	ctrl.maintenanceMu.Unlock()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not complete after releasing blocked launch")
+	}
+	if started.Load() != 0 {
+		t.Fatal("sync job started after shutdown began")
 	}
 }
 

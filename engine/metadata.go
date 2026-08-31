@@ -710,28 +710,6 @@ func renameReplaceFile(root *os.Root, oldname, newname string) error {
 	return renameReplaceRoot(root, oldname, newname, false)
 }
 
-func removeManifestUnavailable(ctx context.Context, mc *MetadataCrawler, db *sql.DB, localMap map[string]*MetadataFile, entries []manifestEntry) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	var stale []*MetadataFile
-	for _, item := range entries {
-		if old := localMap[item.path]; old != nil {
-			stale = append(stale, old)
-		}
-	}
-	if len(stale) > 0 {
-		if err := quarantineAndDelete(ctx, mc.fsRoot, db, stale); err != nil {
-			return err
-		}
-		for _, old := range stale {
-			delete(localMap, old.Path())
-		}
-	}
-	slog.Warn("Manifest entries absent from all mirrors were skipped for this round", "count", len(entries), "removed", len(stale))
-	return nil
-}
-
 // writeFileAtomicRoot replaces rel below root via sibling temp file, close,
 // rename, so an interrupted write never leaves a partial file behind.
 func writeFileAtomicRoot(root *os.Root, rel string, data []byte, perm os.FileMode) error {
@@ -1087,6 +1065,7 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 	}
 
 	pending := toDownload
+	unavailable := 0
 	for retry := 0; len(pending) > 0; retry++ {
 		if retry > 5 {
 			slog.Error("Metadata download has exceeded the maximum retry attempts.")
@@ -1105,12 +1084,14 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 		if roundErr != nil {
 			return roundErr
 		}
-		if err := removeManifestUnavailable(ctx, mc, db, localMap, missing); err != nil {
-			return err
-		}
+		unavailable += len(missing)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+	}
+	if unavailable > 0 {
+		slog.Warn("Manifest entries are temporarily unavailable on all mirrors; keeping cached state and deferring the round", "count", unavailable)
+		return fmt.Errorf("%w: %d entries absent from all mirrors", errManifestPending, unavailable)
 	}
 
 	if err := setMeta(ctx, db, metaTimeBase, timeBaseManifest); err != nil {

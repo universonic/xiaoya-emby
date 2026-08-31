@@ -16,6 +16,11 @@ import (
 // run because the download stage is disabled in the current run mode.
 var errRecoveryPaused = errors.New("pending full rebuild recovery is paused: the download stage is disabled")
 
+const (
+	maxAutomaticRoundRetries = 3
+	automaticRoundRetryDelay = 5 * time.Second
+)
+
 // roundError carries the phase and legacy exit code of a failed phase so
 // the non-daemon path can exit with the same codes as before.
 type roundError struct {
@@ -90,9 +95,13 @@ type Controller struct {
 	cfg   *Config
 	store *SettingsStore
 
-	events chan controllerEvent
-	quit   chan struct{}
-	done   chan struct{}
+	events      chan controllerEvent
+	quit        chan struct{}
+	done        chan struct{}
+	stop        sync.Once
+	jobs        sync.WaitGroup
+	stopping    atomic.Bool
+	lifecycleMu sync.Mutex
 
 	current *Job
 	jobSeq  atomic.Int64
@@ -141,6 +150,9 @@ func NewController(cfg *Config, store *SettingsStore) *Controller {
 }
 
 func (c *Controller) postEvent(ev controllerEvent) bool {
+	if c.stopping.Load() {
+		return false
+	}
 	select {
 	case c.events <- ev:
 		return true
@@ -157,17 +169,21 @@ func (c *Controller) Start() {
 
 // Stop terminates the loop and cancels any running job.
 func (c *Controller) Stop() {
-	select {
-	case <-c.quit:
-		return
-	default:
+	c.stop.Do(func() {
+		c.lifecycleMu.Lock()
+		c.stopping.Store(true)
 		close(c.quit)
-	}
+		c.lifecycleMu.Unlock()
+	})
 	<-c.done
+	c.jobs.Wait()
 }
 
 func (c *Controller) loop() {
 	defer close(c.done)
+	if c.stopping.Load() {
+		return
+	}
 	c.startJob(TriggerStartup, SyncTypeIncremental)
 	for {
 		select {
@@ -187,6 +203,12 @@ func (c *Controller) loop() {
 }
 
 func (c *Controller) handleEvent(ev controllerEvent) {
+	if c.stopping.Load() {
+		if ev.resp != nil {
+			ev.resp <- controllerReply{err: errControlUnavailable}
+		}
+		return
+	}
 	switch ev.kind {
 	case evTrigger:
 		reply := c.handleTrigger(ev.syncType, ev.confirm)
@@ -219,8 +241,12 @@ func (c *Controller) Trigger(syncType string, confirm bool) (jobID, effectiveMod
 	if !c.postEvent(controllerEvent{kind: evTrigger, syncType: syncType, confirm: confirm, resp: resp}) {
 		return "", "", errControlUnavailable
 	}
-	reply := <-resp
-	return reply.jobID, reply.effectiveMode, reply.err
+	select {
+	case reply := <-resp:
+		return reply.jobID, reply.effectiveMode, reply.err
+	case <-c.done:
+		return "", "", errControlUnavailable
+	}
 }
 
 // Abort requests cooperative cancellation of the running job. Aborting
@@ -231,8 +257,12 @@ func (c *Controller) Abort() (accepted bool, cancelRequested bool, err error) {
 	if !c.postEvent(controllerEvent{kind: evAbort, resp: resp}) {
 		return false, false, errControlUnavailable
 	}
-	reply := <-resp
-	return reply.accepted, reply.cancelRequested, reply.err
+	select {
+	case reply := <-resp:
+		return reply.accepted, reply.cancelRequested, reply.err
+	case <-c.done:
+		return false, false, errControlUnavailable
+	}
 }
 
 var errControlUnavailable = errors.New("control plane unavailable")
@@ -275,6 +305,9 @@ func (c *Controller) handleTrigger(syncType string, confirm bool) controllerRepl
 		effective = pending.syncType()
 	}
 	job := c.launchJob(syncType, effective, TriggerManual, settings)
+	if job == nil {
+		return controllerReply{err: errControlUnavailable}
+	}
 	return controllerReply{accepted: true, jobID: job.ID, effectiveMode: effective}
 }
 
@@ -295,6 +328,9 @@ func (c *Controller) handleAbort() controllerReply {
 // startJob launches a job with the current settings snapshot unless one is
 // already running (used by the internal startup/cron triggers).
 func (c *Controller) startJob(trigger, syncType string) {
+	if c.stopping.Load() {
+		return
+	}
 	if c.current != nil {
 		slog.Warn("Skipping scheduled sync trigger: a job is already running", "trigger", trigger)
 		c.scheduleNextCron()
@@ -326,6 +362,12 @@ func (c *Controller) launchJob(requested, effective, trigger string, settings Sy
 	// Serialize job staging with orphan GC. Idle GC is time-bounded, so a
 	// trigger can wait at most its short maintenance lease here.
 	c.maintenanceMu.Lock()
+	c.lifecycleMu.Lock()
+	if c.stopping.Load() {
+		c.lifecycleMu.Unlock()
+		c.maintenanceMu.Unlock()
+		return nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	j := &Job{
 		ID:       fmt.Sprintf("job-%d", c.jobSeq.Add(1)),
@@ -339,11 +381,14 @@ func (c *Controller) launchJob(requested, effective, trigger string, settings Sy
 	c.busy.Store(true)
 	globalStatus.startJob(trigger, effective, j.ID)
 	slog.Info("Sync job started", "job", j.ID, "trigger", trigger, "requested", requested, "effective", effective)
+	c.jobs.Add(1)
 	go func() {
+		defer c.jobs.Done()
 		defer c.maintenanceMu.Unlock()
 		outcome, err := c.runRound(j.ctx, j.Settings, requested, trigger, j.Revision)
 		c.postEvent(controllerEvent{kind: evJobDone, job: j, outcome: outcome, err: err})
 	}()
+	c.lifecycleMu.Unlock()
 	return j
 }
 
@@ -402,52 +447,55 @@ func (c *Controller) scheduleNextCron() {
 	slog.Info("Next task will be started", "at", next.Format(time.RFC3339), "wait", d.Round(time.Second))
 }
 
+// retryRound caps only the automatic outer retry policy. File downloads keep
+// their own independent retry limits.
+func retryRound(ctx context.Context, automatic bool, delay time.Duration, attempt func() error) error {
+	var err error
+	for retry := 0; ; retry++ {
+		err = attempt()
+		if err == nil || ctx.Err() != nil || isDeferredErr(err) || !automatic || retry >= maxAutomaticRoundRetries {
+			return err
+		}
+		slog.Error("Critical error; the automatic round will retry", "retry", retry+1, "max_retries", maxAutomaticRoundRetries, "delay", delay, "error", err)
+		if sleepErr := sleepContext(ctx, delay); sleepErr != nil {
+			return sleepErr
+		}
+	}
+}
+
 // runSyncRound executes one complete round (pending resolution, optional
 // download phase, optional media compare/copy) with the retry policy of
-// its trigger: automatic daemon rounds retry critical phase errors after
-// 5s (cancellation-aware); manual and non-daemon rounds end on the first
-// phase failure; deferred conditions end the round for every trigger type.
+// its trigger: automatic daemon rounds retry critical phase errors up to
+// three times; manual and non-daemon rounds end on the first phase failure;
+// deferred conditions end the round for every trigger type.
 //
 // Pending recovery is re-probed before every attempt: when a previous
 // attempt completed the full rebuild but failed a later phase, the retry
 // falls back to the requested (typically incremental) mode instead of
 // starting a brand-new destructive rebuild.
 func (cfg *Config) runSyncRound(ctx context.Context, s SyncSettings, requested, trigger string, revision int64) (string, error) {
-	var lastErr error
-	for {
+	automatic := trigger != TriggerManual && cfg.RunAsDaemon
+	lastErr := retryRound(ctx, automatic, automaticRoundRetryDelay, func() error {
 		pending, err := probePendingFullSync(cfg.DownloadDir)
 		if err != nil {
 			slog.Error("Cannot inspect pending full sync state", "error", err)
-			lastErr = &roundError{code: 2, phase: "download", err: err}
-		} else {
-			paused := pending != nil && !s.DownloadEnabled()
-			globalStatus.setPending(pending != nil, paused)
-			if paused {
-				return OutcomeDeferred, errRecoveryPaused
-			} else {
-				effective := requested
-				if pending != nil {
-					effective = pending.syncType()
-					if requested != effective {
-						slog.Info("Requested sync mode is overridden by pending full rebuild recovery", "requested", requested, "effective", effective)
-					}
-				}
-				globalStatus.setSyncType(effective)
-				lastErr = cfg.runSyncRoundOnce(ctx, s, effective, revision)
+			return &roundError{code: 2, phase: "download", err: err}
+		}
+		paused := pending != nil && !s.DownloadEnabled()
+		globalStatus.setPending(pending != nil, paused)
+		if paused {
+			return fmt.Errorf("%w: %w", errDeferred, errRecoveryPaused)
+		}
+		effective := requested
+		if pending != nil {
+			effective = pending.syncType()
+			if requested != effective {
+				slog.Info("Requested sync mode is overridden by pending full rebuild recovery", "requested", requested, "effective", effective)
 			}
 		}
-		if lastErr == nil || ctx.Err() != nil || isDeferredErr(lastErr) {
-			break
-		}
-		if trigger == TriggerManual || !cfg.RunAsDaemon {
-			break
-		}
-		slog.Error("Critical error; the automatic round will retry in 5s", "error", lastErr)
-		if serr := sleepContext(ctx, 5*time.Second); serr != nil {
-			lastErr = serr
-			break
-		}
-	}
+		globalStatus.setSyncType(effective)
+		return cfg.runSyncRoundOnce(ctx, s, effective, revision)
+	})
 	switch {
 	case lastErr == nil:
 		return OutcomeSuccess, nil
@@ -512,18 +560,21 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 		return nil
 	}
 
+	globalStatus.setPhase(PhaseComparing)
 	filesToPreserve, err := cfg.compareMetadata(ctx, s, remote)
 	if err != nil {
 		return &roundError{code: 126, phase: "compare", err: err}
 	}
 	slog.Info("Metadata files to sync", "count", len(filesToPreserve))
 
+	globalStatus.setPhase(PhasePreparing)
 	filesNeedUpdate, err := cfg.prepareMetadataUpdate(ctx, s, filesToPreserve)
 	if err != nil {
 		return &roundError{code: 127, phase: "prepare", err: err}
 	}
 	slog.Info("Files need to be updated", "count", len(filesNeedUpdate))
 
+	globalStatus.setPhase(PhaseCopying)
 	if err := cfg.syncMetadata(ctx, s, filesNeedUpdate); err != nil {
 		return &roundError{code: 128, phase: "copy", err: err}
 	}

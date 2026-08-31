@@ -2,8 +2,10 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,6 +187,22 @@ func TestStatusHTTPHandlers(t *testing.T) {
 		!strings.Contains(body.String(), "st.running && !showProgress && INDET_PHASES.has(st.phase)") {
 		t.Fatal("status page no longer prioritizes an active download plan over indeterminate phases")
 	}
+	for _, required := range []string{
+		`let authenticated = false`,
+		`control.read_only && authenticated`,
+		`lastStatus.config_error`,
+		`开启以下删除功能`,
+		`opsSubmitting = true`,
+		`Cron 已重新排程；其他设置下一轮生效`,
+		`服务端未配置 CONTROL_TOKEN`,
+		`"comparing": "校验 strm/Alist"`,
+		`"preparing": "生成更新计划"`,
+		`"copying": "同步到媒体库"`,
+	} {
+		if !strings.Contains(body.String(), required) {
+			t.Fatalf("status page contract missing %q", required)
+		}
+	}
 
 	resp, err = http.Get(srv.URL + "/nope")
 	if err != nil {
@@ -194,6 +212,83 @@ func TestStatusHTTPHandlers(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown path status = %d", resp.StatusCode)
 	}
+}
+
+func TestStartStatusServerReturnsListenError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done, err := startStatusServer(ctx, ln.Addr().String(), http.NotFoundHandler())
+	if err == nil {
+		cancel()
+		if done != nil {
+			<-done
+		}
+		t.Fatal("occupied address did not return a listen error")
+	}
+	cancel()
+	if done != nil {
+		t.Fatal("listen failure returned a server completion channel")
+	}
+}
+
+func TestStartStatusServerShutsDownOnCancellation(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Close()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done, err := startStatusServer(ctx, addr, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDone := make(chan struct{})
+	go func() {
+		resp, err := http.Get("http://" + addr)
+		if err == nil {
+			resp.Body.Close()
+		}
+		close(requestDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("status request did not reach the handler")
+	}
+	cancel()
+	select {
+	case <-done:
+		t.Fatal("status server shut down before its active handler returned")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("status server did not shut down after cancellation")
+	}
+	<-requestDone
 }
 
 func TestRingLogHandlerTruncatesAndBoundedBytes(t *testing.T) {

@@ -131,21 +131,22 @@
     <h2>同步控制</h2>
     <div class="ops">
       <label>同步类型
-        <select id="sync-type">
+        <select id="sync-type" disabled>
           <option value="incremental" selected>增量同步（默认）</option>
           <option value="full-relaxed">宽松全量（按大小/时间复用）</option>
           <option value="full-strict">严格全量（清空后全部重新下载）</option>
         </select>
       </label>
-      <button class="primary" id="trigger">触发同步</button>
+      <button class="primary" id="trigger" disabled>触发同步</button>
       <button class="danger" id="abort" disabled>中止当前任务</button>
       <span class="jobstate" id="job-state">-</span>
     </div>
     <div class="msg" id="ops-msg"></div>
     <div class="controls" style="margin-top:10px">
-      <label>控制令牌 <input type="password" id="token" placeholder="Bearer token（仅保存在当前会话）" style="width:240px"></label>
+      <label>控制令牌 <input type="password" id="token" placeholder="Bearer token（仅保存在当前会话）" style="width:240px" disabled></label>
       <span class="hint" id="token-hint"></span>
     </div>
+    <div class="msg" id="config-alert"></div>
   </section>
 
   <section>
@@ -220,8 +221,8 @@
       </div>
     </div>
     <div class="controls" style="margin-top:12px">
-      <button class="primary" id="cfg-save">保存配置</button>
-      <button id="cfg-reset">恢复启动配置</button>
+      <button class="primary" id="cfg-save" disabled>保存配置</button>
+      <button id="cfg-reset" disabled>恢复启动配置</button>
       <span class="hint" id="cfg-rev"></span>
     </div>
     <div class="msg" id="cfg-msg"></div>
@@ -291,7 +292,9 @@ const MIRROR_STATES = {
 const INDET_PHASES = new Set(["starting", "probing", "downloading-manifest", "parsing-manifest", "inventory", "clearing-cache", "cleanup"]);
 let lastSeq = 0, lastUpdated = null, cached = [];
 let cfgRevision = null;
-let statusRequestSeq = 0;
+let statusRequestSeq = 0, configRequestSeq = 0;
+let authenticated = false, authFailed = false, persistError = "";
+let loadedSettings = null, lastStatus = null, opsSubmitting = false;
 
 const state = {
   get token() { return sessionStorage.getItem("xiaoya-token") || ""; },
@@ -329,21 +332,30 @@ function opsMsg(text, cls) {
 
 let strictPending = null;
 async function triggerSync(mode, confirm) {
+  if (!authenticated || opsSubmitting) return;
+  opsSubmitting = true;
+  if (lastStatus) renderOps(lastStatus);
   opsMsg("正在提交…");
-  const resp = await api("/api/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, confirm: !!confirm }) });
-  if (resp.status === 202) {
-    const eff = resp.payload.effective_mode;
-    const note = eff && eff !== mode ? `；所选模式被未完成的全量恢复覆盖为「${SYNC_TYPES[eff] || eff}」` : "";
-    opsMsg(`已接受任务 ${resp.payload.job_id}${note}`, "ok");
+  try {
+    const resp = await api("/api/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode, confirm: !!confirm }) });
+    if (resp.status === 202) {
+      const eff = resp.payload.effective_mode;
+      const note = eff && eff !== mode ? `；所选模式被未完成的全量恢复覆盖为「${SYNC_TYPES[eff] || eff}」` : "";
+      opsMsg(`已接受任务 ${resp.payload.job_id}${note}`, "ok");
+      return;
+    }
+    if (resp.payload && resp.payload.error && resp.payload.error.code === "confirm_required") {
+      strictPending = mode;
+      openStrictDialog();
+      return;
+    }
+    opsMsg(apiErrMsg(resp), "err");
+  } catch {
+    opsMsg("无法连接服务", "err");
+  } finally {
+    opsSubmitting = false;
     await pollStatus();
-    return;
   }
-  if (resp.payload && resp.payload.error && resp.payload.error.code === "confirm_required") {
-    strictPending = mode;
-    openStrictDialog();
-    return;
-  }
-  opsMsg(apiErrMsg(resp), "err");
 }
 
 function openStrictDialog() {
@@ -353,28 +365,60 @@ function openStrictDialog() {
 }
 
 async function abortSync() {
+  if (!authenticated || opsSubmitting) return;
+  opsSubmitting = true;
+  if (lastStatus) renderOps(lastStatus);
   opsMsg("正在请求中止…");
-  const resp = await api("/api/sync/abort", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-  if (resp.status === 202) {
-    opsMsg(resp.payload.cancel_requested ? "已请求取消，等待任务退出…" : "任务正在收尾…", "ok");
-    return;
+  try {
+    const resp = await api("/api/sync/abort", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    if (resp.status === 202) {
+      opsMsg(resp.payload.cancel_requested ? "已请求取消，等待任务退出…" : "任务正在收尾…", "ok");
+      return;
+    }
+    opsMsg(apiErrMsg(resp), "err");
+  } catch {
+    opsMsg("无法连接服务", "err");
+  } finally {
+    opsSubmitting = false;
+    await pollStatus();
   }
-  opsMsg(apiErrMsg(resp), "err");
 }
 
 async function loadConfig() {
-  const resp = await api("/api/config");
-  const sec = $("cfg-section");
-  if (resp.status === 403 || resp.status === 503) {
-    sec.hidden = false;
-    $("cfg-rev").textContent = resp.status === 403 ? "只读模式：控制需要令牌" : "控制不可用（非守护进程）";
-    setInputsDisabled(true);
+  const requestSeq = ++configRequestSeq;
+  authenticated = false;
+  authFailed = false;
+  persistError = "";
+  loadedSettings = null;
+  cfgRevision = null;
+  setInputsDisabled(true);
+  if (lastStatus) renderOps(lastStatus);
+  let resp;
+  try {
+    resp = await api("/api/config");
+  } catch {
+    if (requestSeq !== configRequestSeq) return;
+    $("cfg-section").hidden = false;
+    $("cfg-rev").textContent = "无法连接服务";
+    renderConfigAlert();
     return;
   }
-  if (!resp.ok) return;
-  const cfg = resp.payload;
-  cfgRevision = cfg.revision;
+  if (requestSeq !== configRequestSeq) return;
+  const sec = $("cfg-section");
   sec.hidden = false;
+  if (!resp.ok) {
+    authFailed = resp.status === 403 && !!state.token;
+    $("cfg-rev").textContent = resp.status === 503 ? "控制不可用（非守护进程）" : "配置需要有效的控制令牌";
+    if (lastStatus) renderOps(lastStatus);
+    renderConfigAlert();
+    return;
+  }
+  const cfg = resp.payload;
+  authenticated = true;
+  authFailed = false;
+  persistError = cfg.persist_error || "";
+  loadedSettings = cfg.settings;
+  cfgRevision = cfg.revision;
   setInputsDisabled(false);
   const s = cfg.settings;
   window.__cfgMode = s.run_mode;
@@ -392,6 +436,8 @@ async function loadConfig() {
   $("c-strmskip").value = (s.strm_path_skip_verify || []).join("\n");
   $("cfg-rev").textContent = `修订版本 ${cfg.revision}${cfg.persisted ? "（已持久化覆盖）" : "（启动基线）"}${cfg.persist_error ? " · 持久化异常" : ""}`;
   cfgMsg("");
+  if (lastStatus) renderOps(lastStatus);
+  renderConfigAlert();
 }
 
 function collectConfig() {
@@ -424,33 +470,56 @@ function cfgMsg(text, cls) {
 }
 
 async function saveConfig() {
-  if (cfgRevision === null) return;
-  const body = { revision: cfgRevision, settings: collectConfig() };
-  const resp = await api("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (resp.status === 200) {
-    cfgRevision = resp.payload.revision;
-    window.__cfgMode = resp.payload.settings.run_mode;
-    $("cfg-rev").textContent = `修订版本 ${resp.payload.revision}（已持久化覆盖）`;
-    cfgMsg("配置已保存，将从下一轮同步生效。", "ok");
-    return;
+  if (cfgRevision === null || !loadedSettings || !authenticated) return;
+  const next = collectConfig();
+  const warnings = [];
+  if (next.cleanup && !loadedSettings.cleanup) warnings.push("cleanup：删除下载缓存中远端已不存在的元数据文件、索引记录及空目录。");
+  if (next.purge && !loadedSettings.purge) warnings.push("purge：校验 Alist 目标，并删除媒体库中已确认失效的 .strm 文件及空目录。");
+  if (warnings.length && !confirm("开启以下删除功能：\n\n" + warnings.join("\n\n") + "\n\n确认保存？")) return;
+  const cronChanged = next.run_cron !== loadedSettings.run_cron;
+  setInputsDisabled(true);
+  try {
+    const body = { revision: cfgRevision, settings: next };
+    const resp = await api("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (resp.status === 200) {
+      cfgRevision = resp.payload.revision;
+      loadedSettings = resp.payload.settings;
+      persistError = resp.payload.persist_error || "";
+      window.__cfgMode = resp.payload.settings.run_mode;
+      $("cfg-rev").textContent = `修订版本 ${resp.payload.revision}（已持久化覆盖）`;
+      cfgMsg(cronChanged ? "Cron 已重新排程；其他设置下一轮生效。" : "配置已保存，将从下一轮同步生效。", "ok");
+      await pollStatus();
+      return;
+    }
+    if (resp.payload && resp.payload.error && resp.payload.error.code === "revision_conflict") {
+      cfgMsg("保存冲突：配置已被其他会话修改，正在重新加载。", "err");
+      await loadConfig();
+      return;
+    }
+    cfgMsg(apiErrMsg(resp), "err");
+  } catch {
+    cfgMsg("无法连接服务", "err");
+  } finally {
+    setInputsDisabled(!authenticated);
   }
-  if (resp.payload && resp.payload.error && resp.payload.error.code === "revision_conflict") {
-    cfgMsg("保存冲突：配置已被其他会话修改，正在重新加载。", "err");
-    loadConfig();
-    return;
-  }
-  cfgMsg(apiErrMsg(resp), "err");
 }
 
 async function resetConfig() {
-  if (!confirm("删除持久化覆盖并恢复进程启动时的配置？")) return;
-  const resp = await api("/api/config", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: "{}" });
-  if (resp.status === 200) {
-    await loadConfig();
-    cfgMsg("已恢复启动基线配置，将从下一轮同步生效。", "ok");
-    return;
+  if (!authenticated || !confirm("删除持久化覆盖并恢复进程启动时的配置？")) return;
+  setInputsDisabled(true);
+  try {
+    const resp = await api("/api/config", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: "{}" });
+    if (resp.status === 200) {
+      await loadConfig();
+      cfgMsg("已恢复启动基线配置，将从下一轮同步生效。", "ok");
+      return;
+    }
+    cfgMsg(apiErrMsg(resp), "err");
+  } catch {
+    cfgMsg("无法连接服务", "err");
+  } finally {
+    setInputsDisabled(!authenticated);
   }
-  cfgMsg(apiErrMsg(resp), "err");
 }
 
 function setInputsDisabled(disabled) {
@@ -461,13 +530,22 @@ function setInputsDisabled(disabled) {
 function renderOps(st) {
   const control = st.control || {};
   const running = st.running;
-  const canControl = control.available;
-  const readOnly = control.read_only;
-  $("trigger").disabled = !canControl || running || readOnly;
-  $("abort").disabled = !canControl || !running || readOnly;
-  $("sync-type").disabled = !canControl || running || readOnly;
-  $("token-hint").textContent = !canControl ? "控制不可用（非守护进程模式）" : readOnly ? "未配置 --control-token：只读模式" : "";
-  if (readOnly) state.token && ($("token-hint").textContent += " · 输入令牌以启用控制");
+  const canWrite = control.available && !control.read_only && authenticated && !opsSubmitting;
+  $("trigger").disabled = !canWrite || running;
+  $("abort").disabled = !canWrite || !running;
+  $("sync-type").disabled = !canWrite || running;
+  $("token").disabled = !control.available || control.read_only;
+  $("token-hint").textContent = !control.available
+    ? "控制不可用（非守护进程模式）"
+    : control.read_only
+      ? "服务端未配置 CONTROL_TOKEN；请通过 --control-token 或 CONTROL_TOKEN 配置后重启。"
+      : authenticated
+        ? "当前会话已认证"
+        : authFailed
+          ? "认证失败：控制令牌无效"
+          : state.token
+            ? "正在验证控制令牌…"
+            : "请输入控制令牌以启用控制";
 
   const type = st.sync_type ? (SYNC_TYPES[st.sync_type] || st.sync_type) : "-";
   let job = running
@@ -497,6 +575,15 @@ function renderOps(st) {
   }
 }
 
+function renderConfigAlert() {
+  const alert = $("config-alert");
+  const hasError = !!(lastStatus && lastStatus.config_error);
+  alert.textContent = hasError
+    ? "持久化配置异常：当前使用启动基线。" + (authenticated && persistError ? " 详情：" + persistError : "")
+    : "";
+  alert.className = "msg" + (hasError ? " warn" : "");
+}
+
 async function pollStatus() {
   const requestSeq = ++statusRequestSeq;
   let st;
@@ -508,6 +595,7 @@ async function pollStatus() {
     return;
   }
   if (requestSeq !== statusRequestSeq) return;
+  lastStatus = st;
   lastUpdated = new Date();
   $("stale").textContent = "更新于 " + lastUpdated.toLocaleTimeString("zh-CN", { hour12: false });
 
@@ -521,6 +609,7 @@ async function pollStatus() {
 
   window.__syncRoots = st.sync_roots || [];
   renderOps(st);
+  renderConfigAlert();
 
   const d = st.download, unavailable = d.unavailable || 0;
   const completed = d.downloaded + d.reused + unavailable;

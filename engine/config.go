@@ -186,8 +186,9 @@ func checkMediaOverlap(mediaDir, downloadDir string, roots []string) error {
 
 // Run wires the settings store, the optional status/control server and the
 // controller (daemon) or a single round (non-daemon), then reports the
-// exit code and error through the channels.
-func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
+// exit code and error through the channels. Cancellation stops active work
+// and waits for the status server to shut down.
+func (cfg *Config) Run(ctx context.Context, ecodeCh chan<- int, errCh chan<- error) {
 	baseline, err := cfg.baselineSettings()
 	if err != nil {
 		ecodeCh <- 2
@@ -210,27 +211,43 @@ func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
 		ctrl = NewController(cfg, store)
 	}
 
+	var (
+		statusDone   <-chan struct{}
+		serverCancel context.CancelFunc
+	)
 	if cfg.ListenAddr != "" {
 		installRingLogHandler()
-		serverCtx, serverCancel := context.WithCancel(context.Background())
-		defer serverCancel()
+		var serverCtx context.Context
+		serverCtx, serverCancel = context.WithCancel(ctx)
 		cp := newControlPlane(ctrl, store, cfg.ControlToken)
-		startStatusServer(serverCtx, cfg.ListenAddr, statusHTTPHandler(cp))
+		statusDone, err = startStatusServer(serverCtx, cfg.ListenAddr, statusHTTPHandler(cp))
+		if err != nil {
+			serverCancel()
+			ecodeCh <- 2
+			errCh <- err
+			return
+		}
+	}
+	stopStatusServer := func() {
+		if serverCancel != nil {
+			serverCancel()
+			<-statusDone
+		}
 	}
 
 	if cfg.RunAsDaemon {
 		ctrl.Start()
-		// Daemon mode runs until the process is terminated.
-		done := make(chan struct{})
-		<-done
+		<-ctx.Done()
+		ctrl.Stop()
+		stopStatusServer()
+		ecodeCh <- 0
+		errCh <- nil
 		return
 	}
 
 	// Non-daemon: one round with the effective settings, then exit. Web
 	// control was already reported as unavailable.
-	roundCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	outcome, roundErr := cfg.runSyncRound(roundCtx, settings, SyncTypeIncremental, TriggerStartup, revision)
+	outcome, roundErr := cfg.runSyncRound(ctx, settings, SyncTypeIncremental, TriggerStartup, revision)
 	ecode := 0
 	if roundErr != nil {
 		ecode = 2
@@ -241,6 +258,7 @@ func (cfg *Config) Run(ecodeCh chan<- int, errCh chan<- error) {
 			roundErr = context.Canceled
 		}
 	}
+	stopStatusServer()
 	ecodeCh <- ecode
 	errCh <- roundErr
 }
@@ -697,6 +715,7 @@ func (cfg *Config) Command() *cobra.Command {
 		Short:   "Xiaoya utility for Emby",
 		Long:    `Utility to maintain metadata files in xiaoya media library for Emby`,
 		Version: Version,
+		Args:    cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := SetLogLevel(cfg.LogLevel); err != nil {
 				fmt.Fprintln(os.Stdout, err)
@@ -715,7 +734,7 @@ func (cfg *Config) Command() *cobra.Command {
 			errCh := make(chan error, 1)
 			defer close(errCh)
 
-			go cfg.Run(ecodeCh, errCh)
+			go cfg.Run(cmd.Context(), ecodeCh, errCh)
 
 			ecode, err = <-ecodeCh, <-errCh
 			if err != nil {
@@ -725,13 +744,13 @@ func (cfg *Config) Command() *cobra.Command {
 		},
 	}
 	var version bool
-	cmd.Flags().IntVar(&cfg.RunMode, "mode", 7, "Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata)")
+	cmd.Flags().IntVar(&cfg.RunMode, "mode", 7, "Run mode (4: update download cache, 2: reserved, 1: sync media library)")
 	cmd.Flags().BoolVar(&cfg.RunAsDaemon, "daemon", true, "Run as daemon in foreground.")
 	cmd.Flags().StringVar(&cfg.RunCron, "cron-expr", "0 0 * * *", "Cron expression as scheduled task. Must run as daemon.")
 	cmd.Flags().StringVarP(&cfg.LogLevel, "log-level", "l", defaultLogLevel(), "Minimum log level (debug, info, warn, error). Env: LOG_LEVEL.")
 	cmd.Flags().StringVar(&cfg.ListenAddr, "listen-addr", "127.0.0.1:9527", "Address for the status page (progress, logs and, when permitted, manual controls). Set to \"\" to disable.")
-	cmd.Flags().StringVarP(&cfg.MediaDir, "media-dir", "d", "/media", "Media directory of Emby to maintain metadata.")
-	cmd.Flags().StringVarP(&cfg.DownloadDir, "download-dir", "D", "/download", "Media directory of Emby to download metadata to.")
+	cmd.Flags().StringVarP(&cfg.MediaDir, "media-dir", "d", "/media", "Media library directory maintained for Emby.")
+	cmd.Flags().StringVarP(&cfg.DownloadDir, "download-dir", "D", "/download", "Download cache directory for metadata.")
 	cmd.Flags().BoolVar(&cfg.Cleanup, "cleanup", false, "Cleanup downloaded metadata when file no longer exists on remote server.")
 	cmd.Flags().BoolVarP(&cfg.Purge, "purge", "p", true, "Whether to purge useless file or directory when media is no longer available.")
 	cmd.Flags().BoolVar(&cfg.ForceCrawl, "force-crawl", false, "Force HTML crawling mode instead of manifest-based metadata sync.")

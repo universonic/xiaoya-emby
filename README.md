@@ -6,7 +6,7 @@ It is an alternative to the `xiaoya-emd` utility, with boosted performance and e
 
 ### Build
 
-Build for all platforms:
+The default targets are Linux and macOS for `amd64` and `arm64`:
 
 ```bash
 make
@@ -24,7 +24,8 @@ Build for specific platform (linux-arm64):
 make linux-arm64
 ```
 
-Golang 1.24.x is required.
+Go 1.25.1 is required.
+SQLite requires CGO, so every target builds with `CGO_ENABLED=1`. Native builds use the system C compiler; cross-builds also require a matching C cross-compiler configured through `CC`. An unsupported cross-build fails instead of producing a binary with a nonfunctional SQLite stub.
 
 ### Usage (Command-Line)
 
@@ -43,32 +44,51 @@ Flags:
       --control-token string                      Bearer token protecting the control API. Env: CONTROL_TOKEN (used when the flag is unset). Without a token the web interface is read-only; serve behind TLS.
       --cron-expr string                          Cron expression as scheduled task. Must run as daemon. (default "0 0 * * *")
       --daemon                                    Run as daemon in foreground. (default true)
-  -D, --download-dir string                       Media directory of Emby to download metadata to. (default "/download")
+  -D, --download-dir string                       Download cache directory for metadata. (default "/download")
       --download-workers int                      Number of concurrent download workers. 0 means auto (min(CPU, 8)).
       --force-crawl                               Force HTML crawling mode instead of manifest-based metadata sync.
   -h, --help                                      Print this message.
       --listen-addr string                        Address for the status page (progress, logs and, when permitted, manual controls). Set to "" to disable. (default "127.0.0.1:9527")
   -l, --log-level string                          Minimum log level (debug, info, warn, error). Env: LOG_LEVEL. (default "info")
-  -d, --media-dir string                          Media directory of Emby to maintain metadata. (default "/media")
+  -d, --media-dir string                          Media library directory maintained for Emby. (default "/media")
   -m, --mirror-url strings                        Specify the mirror URL to sync metadata from.
-      --mode int                                  Run mode (4: scan metadata, 2: preserved bit, 1: sync metadata) (default 7)
+      --mode int                                  Run mode (4: update download cache, 2: reserved, 1: sync media library) (default 7)
   -p, --purge                                     Whether to purge useless file or directory when media is no longer available. (default true)
       --strm-path-skip-verify strings             Specify the metadata path to skip verify strm files. For example: "/115".
       --strm-path-skip-verify-from-file string    A file contains a list of strm path to skip verify.
   -v, --version                                   Print software version.
 ```
 
-### Kickstart
+### Quickstart
 
-This software requires a download folder and a media folder. It downloads metadata from mirrors, and modify the URLs in `.strm` files (if necessary, specified by `-r` and `-u`), then copy them to media folder. You should expose the media folder to your Emby server.
-
-Simply start your container with:
+The container runs as UID/GID `568:568`. Both the download cache directory and media library directory must already exist and be writable by that account. On Linux:
 
 ```bash
-docker run -d --name xiaoya-emby -v ${MY_DOWNLOAD_FOLDER}:/download -v ${MY_MEDIA_FOLDER}:/media universonic/xiaoya-emby
+export MY_DOWNLOAD_FOLDER=/path/to/xiaoya-download
+export MY_MEDIA_FOLDER=/path/to/emby-media
+sudo mkdir -p "$MY_DOWNLOAD_FOLDER" "$MY_MEDIA_FOLDER"
+sudo chown 568:568 "$MY_DOWNLOAD_FOLDER" "$MY_MEDIA_FOLDER"
+
+docker run --rm --user 568:568 --entrypoint /bin/bash \
+  -v "$MY_DOWNLOAD_FOLDER:/download" \
+  -v "$MY_MEDIA_FOLDER:/media" \
+  universonic/xiaoya-emby:latest \
+  -c 'test -w /download && test -w /media'
 ```
 
-Enjoy!
+On SELinux hosts, add an appropriate bind-mount label such as `:z`. Then start the daemon:
+
+```bash
+docker run -d --name xiaoya-emby --restart unless-stopped \
+  -v "$MY_DOWNLOAD_FOLDER:/download" \
+  -v "$MY_MEDIA_FOLDER:/media" \
+  -v /etc/localtime:/etc/localtime:ro \
+  -p 127.0.0.1:9527:9527 \
+  universonic/xiaoya-emby:latest \
+  --listen-addr 0.0.0.0:9527
+```
+
+The `/etc/localtime` bind makes Cron use the Linux host timezone; omit or replace it when Docker Desktop does not expose that path. The host port is deliberately bound to `127.0.0.1`. Without `CONTROL_TOKEN` or `--control-token`, the page is read-only. `purge=true` is enabled by default and removes media-library entries only after Alist explicitly confirms that their targets are unavailable; use `--purge=false` to disable it.
 
 ### Metadata Sync Modes
 
@@ -78,6 +98,7 @@ Notes:
 
 - The manifest does not cover every selected path (for example `/115`, `/ISO` and `/PikPak`). Such paths are skipped with a warning and their previously downloaded files are kept; run with `--force-crawl` periodically if you need them in sync via crawling, or use a full rebuild which crawls uncovered roots from two sources.
 - A path that the manifest used to cover but no longer lists is treated as removed only after it stays absent across two consecutive manifest generations; until then its files are protected from cleanup.
+- A file still listed by the manifest but temporarily returning `404` from every mirror keeps its existing cache row, cache file and media copy. The round is marked `deferred` and retries on the next trigger.
 - Cleanup is disabled unless at least two mirrors serving the exact newest generation return identical manifest content. It is also disabled for malformed manifests and refuses to remove more than half of the local library or any root with at least 20 files.
 - Deletions are crash-safe: files are quarantined into `.trash/` before database rows are removed. On restart, quarantined files whose rows still exist (including the pending full-rebuild snapshot) are restored; only committed deletions are discarded. Success markers are written last.
 - Every `files` row carries its own time base (`manifest`, `http`, or `unknown`), a content identity (`etag:size` for strong ETags, otherwise a unique materialization ID) and a provenance. Timestamps are never compared across time bases: a row on a foreign base must first be re-identified via a current HTTP observation (equal size plus equal strong ETag) before its timestamp may be rewritten; otherwise the file is re-downloaded. Rows migrated from older versions start as `unknown`, so the first round after upgrading may issue extra HEAD observations and conservatively re-copy media files that lack strong ETags.
@@ -107,11 +128,14 @@ Web-edited settings are persisted to `downloadDir/.xiaoya-emby.json` (schema-ver
 #### Control API authentication
 
 - `--control-token` (env `CONTROL_TOKEN`) enables Bearer-token auth for the control API (`GET/PUT/DELETE /api/config`, `POST /api/sync`, `POST /api/sync/abort`), checked in constant time. Without a token the page is strictly read-only and rejects every control call with `403`, regardless of listen address or client origin — a same-host reverse proxy therefore never becomes an unauthenticated control channel.
+- `/api/status` and `/api/logs` are intentionally unauthenticated even when a control token is configured. They expose sync state and recent logs, so never publish this listener directly to the public Internet.
 - Write requests additionally require the `X-Requested-With: xiaoya-emby` header (CSRF protection) and `application/json` bodies with a 64 KiB limit.
 - The token travels in cleartext HTTP headers: **on a non-loopback network you must put the page behind a TLS-terminating reverse proxy**, or the token (and thus control of your sync) can be intercepted. The server itself never speaks TLS.
 
 #### Upgrade notes
 
+- Stop the container before backing up SQLite state, then save `/download/.xiaoya-emby.json`, `/download/.metadata.db` and `/media/.metadata.db` if present. Pull the new image, remove the old container, and recreate it with the same mounts, ports, environment and arguments; `docker restart` does not replace the image.
+- Removing the container does not remove bind-mounted data. To uninstall, remove only the container and any state files you intentionally no longer need. Do not delete the media library directory as part of uninstalling this utility.
 - The `files` table gains three columns (`time_base`, `content_id`, `provenance`). The first start after the upgrade migrates existing databases automatically (batched backfill); **do not roll back to an older binary afterwards** — the old positional `INSERT` statements are incompatible with the migrated schema.
 - Skip-verify prefixes (`--strm-path-skip-verify` / `--alist-path-skip-verify`) only narrow media verification. They never change the set of synced roots; cleanup and strict rebuilds always operate on the built-in root set.
 

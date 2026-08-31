@@ -24,6 +24,9 @@ const (
 	PhaseClearingCache = "clearing-cache"
 	PhaseDownloading   = "downloading"
 	PhaseRebuilding    = "rebuilding-index"
+	PhaseComparing     = "comparing"
+	PhasePreparing     = "preparing"
+	PhaseCopying       = "copying"
 	PhaseCleanup       = "cleanup"
 	PhaseSleeping      = "sleeping"
 	PhaseIdle          = "idle"
@@ -674,14 +677,12 @@ func limitConcurrency(h http.Handler) http.Handler {
 // startStatusServer serves the status/control page on addr until ctx is
 // done. The returned channel is closed once the server has fully shut
 // down.
-func startStatusServer(ctx context.Context, addr string, handler http.Handler) <-chan struct{} {
+func startStatusServer(ctx context.Context, addr string, handler http.Handler) (<-chan struct{}, error) {
 	done := make(chan struct{})
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		slog.Error("Failed to start status page server", "addr", addr, "error", err)
-		close(done)
-		return done
+		return nil, fmt.Errorf("listen for status page on %s: %w", addr, err)
 	}
 
 	srv := &http.Server{
@@ -696,17 +697,31 @@ func startStatusServer(ctx context.Context, addr string, handler http.Handler) <
 
 	go func() {
 		defer close(done)
+		serveErr := make(chan error, 1)
 		go func() {
-			<-ctx.Done()
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
+			serveErr <- srv.Serve(ln)
 		}()
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			slog.Error("Status page server failed", "error", err)
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := srv.Shutdown(shutdownCtx)
+			cancel()
+			if err != nil {
+				slog.Error("Failed to shut down status page server", "error", err)
+				if closeErr := srv.Close(); closeErr != nil && closeErr != http.ErrServerClosed {
+					slog.Error("Failed to force-close status page server", "error", closeErr)
+				}
+			}
+			if err := <-serveErr; err != nil && err != http.ErrServerClosed {
+				slog.Error("Status page server failed", "error", err)
+			}
+		case err := <-serveErr:
+			if err != nil && err != http.ErrServerClosed {
+				slog.Error("Status page server failed", "error", err)
+			}
 		}
 	}()
-	return done
+	return done, nil
 }
 
 // formatDuration renders d like "1h02m03s" or "4.5s" for the status page.

@@ -31,6 +31,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       # Workaround: https://github.com/docker/build-push-action/issues/461
       - name: Setup Docker buildx
         uses: docker/setup-buildx-action@79abd3f86f79a9d68a23c75a09a9a85889262adf
@@ -55,6 +58,42 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,format=short
+
+      - name: Build amd64 smoke image
+        uses: docker/build-push-action@84ad562665bb303b549fec655d1b64f9945f3f91
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: xiaoya-emby:smoke-amd64
+          cache-from: type=gha
+
+      - name: Smoke test amd64 image
+        run: |
+          docker run --rm --platform linux/amd64 xiaoya-emby:smoke-amd64 --version
+          test "$(docker run --rm --platform linux/amd64 --entrypoint uname xiaoya-emby:smoke-amd64 -m)" = "x86_64"
+          cid=$(docker create --platform linux/amd64 xiaoya-emby:smoke-amd64)
+          docker cp "$cid:/app/bin/xiaoya-emby" /tmp/xiaoya-emby-amd64
+          docker rm "$cid"
+          file /tmp/xiaoya-emby-amd64 | grep -q "x86-64"
+
+      - name: Build arm64 smoke image
+        uses: docker/build-push-action@84ad562665bb303b549fec655d1b64f9945f3f91
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: xiaoya-emby:smoke-arm64
+          cache-from: type=gha
+
+      - name: Smoke test arm64 image
+        run: |
+          docker run --rm --platform linux/arm64 xiaoya-emby:smoke-arm64 --version
+          test "$(docker run --rm --platform linux/arm64 --entrypoint uname xiaoya-emby:smoke-arm64 -m)" = "aarch64"
+          cid=$(docker create --platform linux/arm64 xiaoya-emby:smoke-arm64)
+          docker cp "$cid:/app/bin/xiaoya-emby" /tmp/xiaoya-emby-arm64
+          docker rm "$cid"
+          file /tmp/xiaoya-emby-arm64 | grep -q "ARM aarch64"
 
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
