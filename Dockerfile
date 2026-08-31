@@ -1,4 +1,4 @@
-FROM golang:1.25.1 AS build
+FROM golang:1.27.0-bookworm AS build
 
 ARG TARGETARCH
 
@@ -8,7 +8,7 @@ COPY . .
 RUN CGO_ENABLED=1 make "linux-${TARGETARCH}" && \
     cp "bin/xiaoya-emby-linux-${TARGETARCH}" /xiaoya-emby
 
-FROM debian:trixie-slim
+FROM almalinux/9-minimal
 
 RUN groupadd -g 568 apps && \
     useradd -m -u 568 -g apps apps
