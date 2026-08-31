@@ -86,6 +86,7 @@ func TestStatusSnapshotLifecycle(t *testing.T) {
 	s.incDownloaded()
 	s.incUnavailable()
 	s.incFailed()
+	s.addIgnored(2)
 	s.setRetryRound(1)
 	s.setCleanupEnabled(true)
 	s.addDeleted(3)
@@ -99,7 +100,7 @@ func TestStatusSnapshotLifecycle(t *testing.T) {
 	if snap.Mode != ModeManifest || snap.Phase != PhaseDownloading {
 		t.Fatalf("mode/phase = %s/%s", snap.Mode, snap.Phase)
 	}
-	if snap.Download.Planned != 4 || snap.Download.Downloaded != 2 || snap.Download.Unavailable != 1 || snap.Download.Failed != 1 || snap.Download.RetryRound != 1 {
+	if snap.Download.Planned != 4 || snap.Download.Downloaded != 2 || snap.Download.Unavailable != 1 || snap.Download.Failed != 1 || snap.Download.Ignored != 2 || snap.Download.RetryRound != 1 {
 		t.Fatalf("download counters wrong: %+v", snap.Download)
 	}
 	if snap.Cleanup.Deleted != 3 || !snap.Cleanup.GuardTriggered {
@@ -116,7 +117,7 @@ func TestStatusSnapshotLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{`"phase"`, `"downloaded"`, `"guard_triggered"`, `"next_run_at"`} {
+	for _, key := range []string{`"phase"`, `"downloaded"`, `"ignored"`, `"guard_triggered"`, `"next_run_at"`} {
 		if !strings.Contains(string(b), key) {
 			t.Fatalf("json payload missing %s: %s", key, b)
 		}

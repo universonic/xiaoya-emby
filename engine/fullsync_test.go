@@ -516,7 +516,65 @@ func TestRenameConflictRecognizesLinuxFileOverDirectoryError(t *testing.T) {
 	}
 }
 
-func TestIncrementalUnanimous404DefersAndPreservesExistingState(t *testing.T) {
+func TestIncrementalFailureIsIgnoredAndMediaContinues(t *testing.T) {
+	resetGlobalStatus()
+	downloadDir, mediaDir := t.TempDir(), t.TempDir()
+	m1, m2 := newMirrorServer(t), newMirrorServer(t)
+	const (
+		goodPath = "/电影/good.nfo"
+		badPath  = "/电影/bad.nfo"
+	)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, "2024-01-02 03:04 "+goodPath+"\n2024-01-02 03:04 "+badPath+"\n")
+		m.addFile(goodPath, "good-old", `"good-old"`)
+		m.addFile(badPath, "bad-old", `"bad-old"`)
+	}
+	cfg := &Config{DownloadDir: downloadDir, MediaDir: mediaDir}
+	settings := validSettings()
+	settings.RunMode = modeBitDownload | modeBitMedia
+	settings.Cleanup = true
+	settings.Purge = false
+	settings.MirrorURL = []string{m1.URL, m2.URL}
+	settings.DownloadWorkers = 2
+	if err := cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	oldDelay := metadataRetryBaseDelay
+	metadataRetryBaseDelay = 0
+	t.Cleanup(func() { metadataRetryBaseDelay = oldDelay })
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, "2024-01-02 03:05 "+goodPath+"\n2024-01-02 03:05 "+badPath+"\n")
+		m.addFile(goodPath, "good-new", `"good-new"`)
+		inner := m.Server.Config.Handler
+		m.Server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == badPath {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", "8")
+				_, _ = w.Write([]byte("bad"))
+				return
+			}
+			inner.ServeHTTP(w, r)
+		})
+	}
+
+	if err := cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0); err != nil {
+		t.Fatalf("sync with one failed entry = %v, want success", err)
+	}
+	for _, dir := range []string{downloadDir, mediaDir} {
+		if got, err := os.ReadFile(filepath.Join(dir, rootRel(goodPath))); err != nil || string(got) != "good-new" {
+			t.Fatalf("successful file in %s = %q, err = %v", dir, got, err)
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, rootRel(badPath))); err != nil || string(got) != "bad-old" {
+			t.Fatalf("ignored file in %s = %q, err = %v", dir, got, err)
+		}
+	}
+	if snap := globalStatus.snapshot(); snap.Download.Ignored != 1 || snap.Download.Failed != 0 || snap.Download.RetryRound != maxMetadataEntryRetryRounds {
+		t.Fatalf("terminal counters = %+v, want ignored=1 failed=0 retry=%d", snap.Download, maxMetadataEntryRetryRounds)
+	}
+}
+
+func TestIncrementalUnanimous404ContinuesAndPreservesExistingState(t *testing.T) {
 	resetGlobalStatus()
 	downloadDir, mediaDir := t.TempDir(), t.TempDir()
 	m1, m2 := newMirrorServer(t), newMirrorServer(t)
@@ -544,6 +602,17 @@ func TestIncrementalUnanimous404DefersAndPreservesExistingState(t *testing.T) {
 		if got, err := os.ReadFile(p); err != nil || string(got) != "old" {
 			t.Fatalf("initial file %s = %q, err = %v", p, got, err)
 		}
+	}
+	downloadDB, err := openMetadataDB(downloadDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := downloadDB.Exec("DELETE FROM files WHERE path = ?", filePath); err != nil {
+		downloadDB.Close()
+		t.Fatal(err)
+	}
+	if err := downloadDB.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	for _, m := range []*mirrorTestServer{m1, m2} {
@@ -582,14 +651,14 @@ func TestIncrementalUnanimous404DefersAndPreservesExistingState(t *testing.T) {
 	}
 	for _, p := range []string{cachePath, mediaPath} {
 		if got, err := os.ReadFile(p); err != nil || string(got) != "old" {
-			t.Fatalf("file changed during deferred round %s = %q, err = %v", p, got, err)
+			t.Fatalf("file changed while the download retry was pending %s = %q, err = %v", p, got, err)
 		}
 	}
 	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 1 {
 		t.Fatalf("first batch counters = %+v, want unavailable=1 failed=1", snap.Download)
 	}
-	if err := <-done; !isDeferredErr(err) {
-		t.Fatalf("404 round = %v, want deferred", err)
+	if err := <-done; err != nil {
+		t.Fatalf("404 round = %v, want success", err)
 	}
 	if got := m1.gets(filePath) - before1; got != 1 {
 		t.Fatalf("first mirror requests in one trigger = %d, want 1", got)
@@ -599,12 +668,12 @@ func TestIncrementalUnanimous404DefersAndPreservesExistingState(t *testing.T) {
 	}
 	for _, p := range []string{cachePath, mediaPath} {
 		if got, err := os.ReadFile(p); err != nil || string(got) != "old" {
-			t.Fatalf("deferred round did not preserve %s = %q, err = %v", p, got, err)
+			t.Fatalf("unavailable entry was not preserved %s = %q, err = %v", p, got, err)
 		}
 	}
 	db := openTestDB(t, downloadDir)
-	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path = ?", filePath); n != 1 {
-		t.Fatalf("unavailable row count = %d, want 1", n)
+	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path = ?", filePath); n != 0 {
+		t.Fatalf("unavailable row count = %d, want 0", n)
 	}
 	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 0 {
 		t.Fatalf("completed retry counters = %+v, want unavailable=1 failed=0", snap.Download)
@@ -627,6 +696,69 @@ func TestIncrementalUnanimous404DefersAndPreservesExistingState(t *testing.T) {
 		if got, err := os.ReadFile(p); err != nil || string(got) != "new" {
 			t.Fatalf("recovered file %s = %q, err = %v", p, got, err)
 		}
+	}
+}
+
+func TestForceCrawl404PreservesUnindexedMediaAndContinues(t *testing.T) {
+	resetGlobalStatus()
+	downloadDir, mediaDir := t.TempDir(), t.TempDir()
+	m1, m2 := newMirrorServer(t), newMirrorServer(t)
+	const (
+		goodPath = "/电影/good.nfo"
+		gonePath = "/电影/gone.nfo"
+	)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.addDir("/", "电影/", "每日更新/")
+		m.addDir("/电影/", "good.nfo", "gone.nfo")
+		m.addDir("/每日更新/")
+		m.addFile(goodPath, "good-old", `"good-old"`)
+		m.addFile(gonePath, "gone-old", `"gone-old"`)
+	}
+	cfg := &Config{DownloadDir: downloadDir, MediaDir: mediaDir}
+	settings := validSettings()
+	settings.RunMode = modeBitDownload | modeBitMedia
+	settings.Cleanup = true
+	settings.Purge = false
+	settings.ForceCrawl = true
+	settings.MirrorURL = []string{m1.URL, m2.URL}
+	settings.DownloadWorkers = 2
+	if err := cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0); err != nil {
+		t.Fatalf("initial crawl sync failed: %v", err)
+	}
+
+	downloadDB, err := openMetadataDB(downloadDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := downloadDB.Exec("DELETE FROM files WHERE path = ?", gonePath); err != nil {
+		downloadDB.Close()
+		t.Fatal(err)
+	}
+	if err := downloadDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	later := "Mon, 02 Jan 2024 10:01:00 GMT"
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.mu.Lock()
+		m.files[goodPath] = mirrorFile{content: "good-new", etag: `"good-new"`, lastModified: later}
+		delete(m.files, gonePath)
+		m.failPaths[gonePath] = http.StatusNotFound
+		m.mu.Unlock()
+	}
+
+	if err := cfg.runSyncRoundOnce(context.Background(), settings, SyncTypeIncremental, 0); err != nil {
+		t.Fatalf("crawl sync with unavailable entry = %v, want success", err)
+	}
+	for _, dir := range []string{downloadDir, mediaDir} {
+		if got, err := os.ReadFile(filepath.Join(dir, rootRel(goodPath))); err != nil || string(got) != "good-new" {
+			t.Fatalf("successful crawl file in %s = %q, err = %v", dir, got, err)
+		}
+		if got, err := os.ReadFile(filepath.Join(dir, rootRel(gonePath))); err != nil || string(got) != "gone-old" {
+			t.Fatalf("unavailable crawl file in %s = %q, err = %v", dir, got, err)
+		}
+	}
+	if snap := globalStatus.snapshot(); snap.Download.Unavailable != 1 || snap.Download.Failed != 0 {
+		t.Fatalf("crawl terminal counters = %+v, want unavailable=1 failed=0", snap.Download)
 	}
 }
 

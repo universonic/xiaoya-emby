@@ -148,6 +148,7 @@ type statusSnapshot struct {
 		Reused      int `json:"reused"`
 		Unavailable int `json:"unavailable"`
 		Failed      int `json:"failed"`
+		Ignored     int `json:"ignored"`
 		RetryRound  int `json:"retry_round"`
 	} `json:"download"`
 
@@ -201,6 +202,7 @@ type syncStatus struct {
 	downloadReused      int
 	downloadUnavailable int
 	downloadFailed      int
+	downloadIgnored     int
 	downloadRetryRound  int
 
 	cleanupEnabled        bool
@@ -261,6 +263,7 @@ func (s *syncStatus) startJob(trigger, effectiveMode, jobID string) {
 	s.downloadReused = 0
 	s.downloadUnavailable = 0
 	s.downloadFailed = 0
+	s.downloadIgnored = 0
 	s.downloadRetryRound = 0
 	s.cleanupDeleted = 0
 	s.cleanupGuardTriggered = false
@@ -323,6 +326,7 @@ func (s *syncStatus) roundStart() {
 	s.downloadReused = 0
 	s.downloadUnavailable = 0
 	s.downloadFailed = 0
+	s.downloadIgnored = 0
 	s.downloadRetryRound = 0
 	s.cleanupDeleted = 0
 	s.cleanupGuardTriggered = false
@@ -398,6 +402,7 @@ func (s *syncStatus) setDownloadPlan(total, planned int) {
 	s.downloadReused = 0
 	s.downloadUnavailable = 0
 	s.downloadFailed = 0
+	s.downloadIgnored = 0
 	s.downloadRetryRound = 0
 }
 
@@ -431,6 +436,12 @@ func (s *syncStatus) setFailed(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.downloadFailed = n
+}
+
+func (s *syncStatus) addIgnored(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.downloadIgnored += n
 }
 
 func (s *syncStatus) setRetryRound(n int) {
@@ -498,6 +509,7 @@ func (s *syncStatus) snapshot() statusSnapshot {
 	snap.Download.Reused = s.downloadReused
 	snap.Download.Unavailable = s.downloadUnavailable
 	snap.Download.Failed = s.downloadFailed
+	snap.Download.Ignored = s.downloadIgnored
 	snap.Download.RetryRound = s.downloadRetryRound
 	snap.Cleanup.Enabled = s.cleanupEnabled
 	snap.Cleanup.Deleted = s.cleanupDeleted

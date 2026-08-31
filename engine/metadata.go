@@ -66,7 +66,8 @@ const (
 	perRootGuardMinFiles = 20
 	// integrityBatchSize is how many database rows the incremental local
 	// integrity sweep verifies per short-circuited round.
-	integrityBatchSize = 2000
+	integrityBatchSize          = 2000
+	maxMetadataEntryRetryRounds = 5
 )
 
 // maxScanListDecompressedBytes caps how many decompressed bytes are
@@ -78,6 +79,8 @@ var (
 	// maxManifestEntries is a var only so tests can shrink it. Production
 	// currently publishes about 700k entries.
 	maxManifestEntries = 2_000_000
+	// metadataRetryBaseDelay is a var only so tests can remove retry waits.
+	metadataRetryBaseDelay = time.Second
 )
 
 // Metadata state keys stored in the meta table of .metadata.db.
@@ -148,15 +151,14 @@ var (
 // should fall back to HTML crawling.
 var errNoManifest = errors.New("metadata manifest is not available")
 
-// errManifestPending reports a generation that cannot complete because one
-// or more listed files are not yet available on any mirror. It is a
-// deferred condition: rounds end without busy retrying and wait for the
-// next trigger.
+// errManifestPending reports an integrity repair that cannot complete yet.
+// It is a deferred condition: rounds end without busy retrying and wait for
+// the next trigger.
 var errManifestPending = fmt.Errorf("%w: manifest entries are not yet available", errDeferred)
 
-// errDeferred marks authoritative conditions that were not met (pending
-// manifest entries, too few mirrors, mirror disagreement). Both automatic
-// and manual rounds end with outcome=deferred instead of retrying.
+// errDeferred marks authoritative conditions that were not met (an
+// incomplete integrity repair, too few mirrors, mirror disagreement). Both
+// automatic and manual rounds end with outcome=deferred instead of retrying.
 var errDeferred = errors.New("sync deferred")
 
 func isDeferredErr(err error) bool {
@@ -175,6 +177,7 @@ type MetadataCrawler struct {
 	selectedPaths     []string
 	ignoredDirs       []string // TODO:
 	ignoredExtentions []string // TODO:
+	ignoredPaths      map[string]bool
 	cleanup           bool
 	forceCrawl        bool
 	workers           int
@@ -465,6 +468,7 @@ func (mc *MetadataCrawler) workerCount() int {
 // when downloads will actually happen, so a no-op manifest run does not pay
 // for a full tree walk.
 func (mc *MetadataCrawler) Sync(ctx context.Context) error {
+	mc.ignoredPaths = nil
 	globalStatus.setCleanupEnabled(mc.cleanup)
 	if _, err := mc.openRoot(); err != nil {
 		return err
@@ -1065,16 +1069,18 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 	}
 
 	pending := toDownload
-	unavailable := 0
+	var unavailable []manifestEntry
 	for retry := 0; len(pending) > 0; retry++ {
-		if retry > 5 {
-			slog.Error("Metadata download has exceeded the maximum retry attempts.")
-			return fmt.Errorf("%w: maximum retry attempts exceeded", errManifestPending)
+		if retry > maxMetadataEntryRetryRounds {
+			slog.Warn("Ignoring metadata entries after maximum retry attempts; continuing with the remaining files", "count", len(pending))
+			globalStatus.addIgnored(len(pending))
+			globalStatus.setFailed(0)
+			break
 		}
 		if retry > 0 {
 			slog.Info("Failed metadata entries will be retried...", "count", len(pending))
 			globalStatus.setRetryRound(retry)
-			if err := sleepContext(ctx, time.Duration(1<<min(retry, 5))*time.Second); err != nil {
+			if err := sleepContext(ctx, time.Duration(1<<min(retry, maxMetadataEntryRetryRounds))*metadataRetryBaseDelay); err != nil {
 				return err
 			}
 		}
@@ -1084,14 +1090,19 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 		if roundErr != nil {
 			return roundErr
 		}
-		unavailable += len(missing)
+		unavailable = append(unavailable, missing...)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 	}
-	if unavailable > 0 {
-		slog.Warn("Manifest entries are temporarily unavailable on all mirrors; keeping cached state and deferring the round", "count", unavailable)
-		return fmt.Errorf("%w: %d entries absent from all mirrors", errManifestPending, unavailable)
+	for _, item := range pending {
+		mc.markIgnored(item.path)
+	}
+	for _, item := range unavailable {
+		mc.markIgnored(item.path)
+	}
+	if len(unavailable) > 0 {
+		slog.Warn("Manifest entries are temporarily unavailable on all mirrors; keeping cached state and continuing with the remaining files", "count", len(unavailable))
 	}
 
 	if err := setMeta(ctx, db, metaTimeBase, timeBaseManifest); err != nil {
@@ -1378,7 +1389,9 @@ func (mc *MetadataCrawler) syncCrawl(ctx context.Context) error {
 						continue
 					}
 					if errors.Is(derr, fs.ErrNotExist) {
-						slog.Warn("Skipped to download as it appears to no longer exist on the mirror server", "path", job.path)
+						slog.Warn("Crawl entry is unavailable on all mirrors; keeping existing state", "path", job.path)
+						mc.markIgnored(job.path)
+						globalStatus.incUnavailable()
 						if remoteMap != nil {
 							mux.Lock()
 							delete(remoteMap, job.path)
@@ -1387,8 +1400,12 @@ func (mc *MetadataCrawler) syncCrawl(ctx context.Context) error {
 						continue
 					}
 					slog.Error("Failed to download", "path", job.path, "error", derr)
-					globalStatus.incFailed()
 					mux.Lock()
+					if remoteMap != nil {
+						// The crawl already listed this path, so a body failure
+						// must not make cleanup treat the cached copy as stale.
+						remoteMap[job.path] = true
+					}
 					*out = append(*out, job)
 					mux.Unlock()
 				}
@@ -1463,18 +1480,14 @@ func (mc *MetadataCrawler) syncCrawl(ctx context.Context) error {
 	if poolErr != nil {
 		return poolErr
 	}
+	globalStatus.setFailed(len(failed))
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	for retry := 0; len(failed) > 0; retry++ {
-		if retry > 5 {
-			slog.Error("Metadata download has exceeded the maximum retry attempts.")
-			return fmt.Errorf("maximum retry attempts exceeded")
-		}
-		if retry > 0 {
-			slog.Info("Failed metadata entries will be retried...", "count", len(failed))
-		}
+	for retry := 1; len(failed) > 0 && retry <= maxMetadataEntryRetryRounds; retry++ {
+		slog.Info("Failed metadata entries will be retried...", "count", len(failed))
+		globalStatus.setRetryRound(retry)
 		var next []failedEntry
 		jobs := make(chan failedEntry)
 		go func() {
@@ -1491,9 +1504,18 @@ func (mc *MetadataCrawler) syncCrawl(ctx context.Context) error {
 			return err
 		}
 		failed = next
+		globalStatus.setFailed(len(failed))
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+	}
+	if len(failed) > 0 {
+		slog.Warn("Ignoring metadata entries after maximum retry attempts; continuing with the remaining files", "count", len(failed))
+		for _, item := range failed {
+			mc.markIgnored(item.path)
+		}
+		globalStatus.addIgnored(len(failed))
+		globalStatus.setFailed(0)
 	}
 
 	if err := setMeta(ctx, db, metaTimeBase, timeBaseHTTP); err != nil {
@@ -1556,6 +1578,15 @@ func (mc *MetadataCrawler) LocalFiles() ([]*MetadataFile, error) {
 	defer db.Close()
 
 	return mc.localFiles(context.Background(), db)
+}
+
+func (mc *MetadataCrawler) markIgnored(path string) {
+	mc.mux.Lock()
+	defer mc.mux.Unlock()
+	if mc.ignoredPaths == nil {
+		mc.ignoredPaths = make(map[string]bool)
+	}
+	mc.ignoredPaths[path] = true
 }
 
 func (mc *MetadataCrawler) localFiles(ctx context.Context, db *sql.DB) ([]*MetadataFile, error) {

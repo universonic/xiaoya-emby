@@ -511,6 +511,7 @@ func (cfg *Config) runSyncRound(ctx context.Context, s SyncSettings, requested, 
 // runSyncRoundOnce runs every phase exactly once.
 func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncType string, revision int64) error {
 	var remote []*MetadataFile
+	var ignoredPaths map[string]bool
 	if s.DownloadEnabled() {
 		crawler, err := NewMetadataCrawler(ctx, cfg.DownloadDir, s)
 		if err != nil {
@@ -547,6 +548,7 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 		if err != nil {
 			return &roundError{code: 2, phase: "download", err: err}
 		}
+		ignoredPaths = crawler.ignoredPaths
 	} else {
 		crawler := &MetadataCrawler{downloadDir: cfg.DownloadDir}
 		var err error
@@ -564,6 +566,9 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 	filesToPreserve, err := cfg.compareMetadata(ctx, s, remote)
 	if err != nil {
 		return &roundError{code: 126, phase: "compare", err: err}
+	}
+	for path := range ignoredPaths {
+		filesToPreserve[path] = true
 	}
 	slog.Info("Metadata files to sync", "count", len(filesToPreserve))
 

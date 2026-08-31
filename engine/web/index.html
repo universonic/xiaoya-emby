@@ -159,6 +159,7 @@
       <div class="stat"><div class="k">复用</div><div class="v" id="d-reused">-</div></div>
       <div class="stat"><div class="k">远端不存在</div><div class="v" id="d-unavailable">-</div></div>
       <div class="stat"><div class="k">失败</div><div class="v" id="d-failed">-</div></div>
+      <div class="stat"><div class="k">本轮忽略</div><div class="v" id="d-ignored">-</div></div>
       <div class="stat"><div class="k">重试轮次</div><div class="v" id="d-retry">-</div></div>
       <div class="stat"><div class="k">预计剩余</div><div class="v" id="d-eta">-</div></div>
     </div>
@@ -611,8 +612,8 @@ async function pollStatus() {
   renderOps(st);
   renderConfigAlert();
 
-  const d = st.download, unavailable = d.unavailable || 0;
-  const completed = d.downloaded + d.reused + unavailable;
+  const d = st.download, unavailable = d.unavailable || 0, ignored = d.ignored || 0;
+  const completed = d.downloaded + d.reused + unavailable + ignored;
   const planned = Math.max(d.planned, completed + d.failed);
   const showProgress = st.running && planned > 0;
   const latest = !st.running && st.history && st.history.length ? st.history[0] : null;
@@ -638,10 +639,10 @@ async function pollStatus() {
     if (planned > 0) {
       if (pct >= 100) {
         fillCls += d.failed > 0 ? " warn" : " done";
-        label = `完成：${completed} / ${planned}` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
+        label = `完成：${completed} / ${planned}` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (ignored > 0 ? ` · 忽略 ${ignored}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
       } else {
         fillCls += d.failed > 0 ? " warn active" : " active";
-        label = `${completed} / ${planned}（${pct}%）` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
+        label = `${completed} / ${planned}（${pct}%）` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (ignored > 0 ? ` · 忽略 ${ignored}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
       }
     } else if (d.total > 0) {
       fillCls += " done";
@@ -662,6 +663,7 @@ async function pollStatus() {
   const failedEl = $("d-failed");
   failedEl.textContent = d.failed;
   failedEl.className = "v" + (d.failed > 0 ? " alert" : "");
+  $("d-ignored").textContent = ignored;
   $("d-retry").textContent = d.retry_round;
   if (completed > 0 && planned > completed) {
     const dur = (Date.now() - new Date(st.phase_started_at || st.round_started_at).getTime()) / 1000;
