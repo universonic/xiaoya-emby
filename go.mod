@@ -1,6 +1,6 @@
 module github.com/universonic/xiaoya-emby
 
-go 1.25.1
+go 1.27
 
 require (
 	github.com/PuerkitoBio/goquery v1.10.3
