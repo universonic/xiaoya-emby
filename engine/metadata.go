@@ -492,7 +492,7 @@ func (mc *MetadataCrawler) Sync(ctx context.Context) error {
 // openRoot opens the rooted filesystem view of downloadDir used by all
 // download/cleanup operations.
 func (mc *MetadataCrawler) openRoot() (*os.Root, error) {
-	if err := os.MkdirAll(mc.downloadDir, dirPerm); err != nil {
+	if err := os.MkdirAll(mc.downloadDir, dirPerm); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 	root, err := os.OpenRoot(mc.downloadDir)
@@ -631,7 +631,7 @@ func (mc *MetadataCrawler) reconcileTrash(ctx context.Context, db *sql.DB, pendi
 			} else if !os.IsNotExist(statErr) {
 				return statErr
 			}
-			if err := mc.fsRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil {
+			if err := mc.fsRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil && !os.IsExist(err) {
 				return err
 			}
 			if err := renameReplaceCachePath(mc.fsRoot, name, rel); err != nil {
@@ -2128,7 +2128,7 @@ func (mc *MetadataCrawler) download(ctx context.Context, mirror, path string, o 
 			return nil, &fsError{errors.New("metadata filesystem root is not open")}
 		}
 		filePath := rootRel(f.Path())
-		if err := mc.fsRoot.MkdirAll(filepath.Dir(filePath), dirPerm); err != nil {
+		if err := mc.fsRoot.MkdirAll(filepath.Dir(filePath), dirPerm); err != nil && !os.IsExist(err) {
 			return nil, &fsError{err}
 		}
 
@@ -2774,7 +2774,7 @@ func quarantineAndDelete(ctx context.Context, root *os.Root, db *sql.DB, toDelet
 		}
 		fp := rootRel(oldFile.Path())
 		trashPath := filepath.Join(trashDirName, fp)
-		if err := root.MkdirAll(filepath.Dir(trashPath), dirPerm); err != nil {
+		if err := root.MkdirAll(filepath.Dir(trashPath), dirPerm); err != nil && !os.IsExist(err) {
 			slog.Warn("Failed to prepare quarantine for stale metadata file", "path", oldFile.Path(), "error", err)
 			continue
 		}
@@ -2814,7 +2814,7 @@ func quarantineAndDelete(ctx context.Context, root *os.Root, db *sql.DB, toDelet
 	// pruning empty parent directories. Failures here are harmless: the
 	// leftovers are swept on the next processing round.
 	for _, q := range renamed {
-		if err := root.RemoveAll(q.trash); err != nil {
+		if err := root.RemoveAll(q.trash); err != nil && !os.IsNotExist(err) {
 			slog.Warn("Failed to remove quarantined file", "path", q.trash, "error", err)
 			continue
 		}
@@ -2822,7 +2822,7 @@ func quarantineAndDelete(ctx context.Context, root *os.Root, db *sql.DB, toDelet
 	}
 	// Best effort: drop the now-empty quarantine tree. Anything left
 	// (e.g. from an earlier interrupted cleanup) is swept next round.
-	if err := root.RemoveAll(trashDirName); err != nil {
+	if err := root.RemoveAll(trashDirName); err != nil && !os.IsNotExist(err) {
 		slog.Warn("Failed to remove quarantine directory", "path", trashDirName, "error", err)
 	}
 	return nil
