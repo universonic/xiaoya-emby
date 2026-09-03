@@ -464,7 +464,7 @@ func (mc *MetadataCrawler) workerCount() int {
 
 // Sync downloads metadata, preferring the manifest-based mode and falling
 // back to HTML crawling when the manifest is unavailable or force crawl is
-// requested. Stale ".tmp" files are swept by the mode implementations, only
+// requested. Stale ".xtmp" files are swept by the mode implementations, only
 // when downloads will actually happen, so a no-op manifest run does not pay
 // for a full tree walk.
 func (mc *MetadataCrawler) Sync(ctx context.Context) error {
@@ -551,7 +551,7 @@ func deleteEmptyRootDirs(root *os.Root, dir string) {
 
 // sweepTempFiles removes stale temporary files left over from interrupted
 // downloads (owned exclusively by this program: names of the form
-// "<target>.xiaoya-<rand>.tmp"). Legitimate remote files ending in ".tmp"
+// "<target>.xtmp"). Legitimate remote files ending in ".xtmp"
 // are never touched.
 func (mc *MetadataCrawler) sweepTempFiles(ctx context.Context) {
 	if mc.fsRoot == nil {
@@ -659,21 +659,17 @@ func (mc *MetadataCrawler) reconcileTrash(ctx context.Context, db *sql.DB, pendi
 	return mc.fsRoot.RemoveAll(trashDirName)
 }
 
-// ownTempInfix identifies this program's download temp files
-// ("<infix>.xiaoya-<rand>.tmp").
-const ownTempInfix = ".xiaoya-"
-
 var ownTempSeq atomic.Uint64
 
 func isOwnTempName(name string) bool {
-	return strings.Contains(name, ownTempInfix) && strings.HasSuffix(name, ".tmp")
+	return strings.HasSuffix(name, ".xtmp")
 }
 
 // tempPathFor returns a unique sibling temp path for filePath, so two
 // workers downloading the same target never collide and the sweep can tell
-// our temp files apart from genuine ".tmp" content.
+// our temp files apart from genuine ".xtmp" content.
 func tempPathFor(filePath string) string {
-	return fmt.Sprintf("%s%s%d-%d.tmp", filePath, ownTempInfix, os.Getpid(), ownTempSeq.Add(1))
+	return fmt.Sprintf("%s-%d.xtmp", filePath, ownTempSeq.Add(1))
 }
 
 func isRenameConflict(err error) bool {

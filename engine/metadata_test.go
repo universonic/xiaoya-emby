@@ -331,7 +331,7 @@ func TestRenameReplaceFileDoesNotRemoveDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	if err := root.WriteFile("source.tmp", []byte("new"), filePerm); err != nil {
+	if err := root.WriteFile("source.xtmp", []byte("new"), filePerm); err != nil {
 		t.Fatal(err)
 	}
 	if err := root.MkdirAll("target", dirPerm); err != nil {
@@ -341,13 +341,13 @@ func TestRenameReplaceFileDoesNotRemoveDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := renameReplaceFile(root, "source.tmp", "target"); err == nil {
+	if err := renameReplaceFile(root, "source.xtmp", "target"); err == nil {
 		t.Fatal("media-safe replacement unexpectedly removed a directory")
 	}
 	if got, err := root.ReadFile(filepath.Join("target", "media")); err != nil || string(got) != "keep" {
 		t.Fatalf("media directory was changed: %q, %v", got, err)
 	}
-	if _, err := root.Stat("source.tmp"); err != nil {
+	if _, err := root.Stat("source.xtmp"); err != nil {
 		t.Fatalf("source temp file was removed after rejected replacement: %v", err)
 	}
 }
