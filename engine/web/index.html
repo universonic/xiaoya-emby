@@ -161,7 +161,7 @@
       <div class="stat"><div class="k">失败</div><div class="v" id="d-failed">-</div></div>
       <div class="stat"><div class="k">本轮忽略</div><div class="v" id="d-ignored">-</div></div>
       <div class="stat"><div class="k">重试轮次</div><div class="v" id="d-retry">-</div></div>
-      <div class="stat"><div class="k">预计剩余</div><div class="v" id="d-eta">-</div></div>
+      <div class="stat"><div class="k">预计完成</div><div class="v" id="d-eta">-</div></div>
     </div>
   </section>
 
@@ -665,18 +665,18 @@ async function pollStatus() {
   failedEl.className = "v" + (d.failed > 0 ? " alert" : "");
   $("d-ignored").textContent = ignored;
   $("d-retry").textContent = d.retry_round;
-  if (completed > 0 && planned > completed) {
-    const dur = (Date.now() - new Date(st.phase_started_at || st.round_started_at).getTime()) / 1000;
-    const rate = completed / Math.max(dur, 1);
-    const remain = Math.round((planned - completed) / rate);
-    $("d-eta").textContent = remain > 0 ? `约 ${remain}s（${rate.toFixed(1)}/s）` : "即将完成";
+  if (st.running && d.estimated_completion_at) {
+    const rate = Number(d.rate_per_second || 0);
+    $("d-eta").textContent = `约 ${fmtTime(d.estimated_completion_at)}（${rate < 1 ? rate.toFixed(2) : rate.toFixed(1)}/s）`;
   } else {
     $("d-eta").textContent = d.planned === completed && d.planned > 0 ? "已完成" : "-";
   }
 
   $("s-start").textContent = fmtTime(st.round_started_at);
-  const durMs = st.round_started_at && !st.round_started_at.startsWith("0001-")
-    ? Date.now() - new Date(st.round_started_at).getTime() : null;
+  const startedMs = Date.parse(st.round_started_at);
+  const observedMs = Date.parse(st.updated_at);
+  const durMs = st.running && Number.isFinite(startedMs) && Number.isFinite(observedMs)
+    ? Math.max(0, observedMs - startedMs) : (latest ? latest.duration_ms : null);
   $("s-dur").textContent = durMs != null ? Math.round(durMs / 1000) + "s" : "-";
   $("s-next").textContent = fmtTime(st.next_run_at);
   $("s-manifest").textContent = st.manifest.last_modified || "-";

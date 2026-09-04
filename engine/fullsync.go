@@ -776,6 +776,7 @@ func (mc *MetadataCrawler) runFullPages(
 						return ctx.Err()
 					}
 					if herr == nil && strictResumeMatch(row, info, rm) {
+						globalStatus.incReused()
 						return nil // verified progress: keep row and file
 					}
 				}

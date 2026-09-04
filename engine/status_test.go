@@ -129,6 +129,49 @@ func TestStatusSnapshotLifecycle(t *testing.T) {
 	}
 }
 
+func TestEstimateDownloadCompletionUsesRoundStart(t *testing.T) {
+	started := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
+	observed := started.Add(10 * time.Minute)
+	estimated, rate := estimateDownloadCompletion(started, observed, 25, 100)
+	if estimated == nil || !estimated.Equal(started.Add(40*time.Minute)) {
+		t.Fatalf("estimated completion = %v, want %v", estimated, started.Add(40*time.Minute))
+	}
+	if rate != 25.0/600.0 {
+		t.Fatalf("rate = %v, want %v", rate, 25.0/600.0)
+	}
+	if estimated, rate := estimateDownloadCompletion(started, observed, 100, 100); estimated != nil || rate != 0 {
+		t.Fatalf("completed plan estimate = %v rate=%v, want no estimate", estimated, rate)
+	}
+	if estimated, rate := estimateDownloadCompletion(started, started.Add(2*time.Hour), 1, 2_000_000); estimated != nil || rate <= 0 {
+		t.Fatalf("overflowing estimate = %v rate=%v, want omitted estimate with valid rate", estimated, rate)
+	}
+}
+
+func TestStatusSnapshotIncludesRoundBasedEstimate(t *testing.T) {
+	started := time.Now().Add(-10 * time.Minute)
+	s := &syncStatus{
+		running:            true,
+		roundStarted:       started,
+		downloadPlanned:    100,
+		downloadDownloaded: 25,
+	}
+	snap := s.snapshot()
+	if snap.Download.EstimatedCompletionAt == nil {
+		t.Fatal("running download snapshot omitted ETA")
+	}
+	want := started.Add(40 * time.Minute)
+	if delta := snap.Download.EstimatedCompletionAt.Sub(want); delta < -time.Second || delta > time.Second {
+		t.Fatalf("snapshot ETA = %v, want near %v", snap.Download.EstimatedCompletionAt, want)
+	}
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"estimated_completion_at"`) || !strings.Contains(string(b), `"rate_per_second"`) {
+		t.Fatalf("snapshot JSON omitted ETA fields: %s", b)
+	}
+}
+
 func TestStatusHTTPHandlers(t *testing.T) {
 	resetGlobalStatus()
 	globalStatus.setPhase(PhaseDownloading)
@@ -187,6 +230,10 @@ func TestStatusHTTPHandlers(t *testing.T) {
 	if !strings.Contains(body.String(), "const showProgress = st.running && planned > 0") ||
 		!strings.Contains(body.String(), "st.running && !showProgress && INDET_PHASES.has(st.phase)") {
 		t.Fatal("status page no longer prioritizes an active download plan over indeterminate phases")
+	}
+	if !strings.Contains(body.String(), "d.estimated_completion_at") ||
+		!strings.Contains(body.String(), "Math.max(0, observedMs - startedMs)") {
+		t.Fatal("status page no longer uses the round-based server estimate")
 	}
 	for _, required := range []string{
 		`let authenticated = false`,

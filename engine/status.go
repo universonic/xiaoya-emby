@@ -142,14 +142,16 @@ type statusSnapshot struct {
 	} `json:"manifest"`
 
 	Download struct {
-		Total       int `json:"total"`
-		Planned     int `json:"planned"`
-		Downloaded  int `json:"downloaded"`
-		Reused      int `json:"reused"`
-		Unavailable int `json:"unavailable"`
-		Failed      int `json:"failed"`
-		Ignored     int `json:"ignored"`
-		RetryRound  int `json:"retry_round"`
+		Total                 int        `json:"total"`
+		Planned               int        `json:"planned"`
+		Downloaded            int        `json:"downloaded"`
+		Reused                int        `json:"reused"`
+		Unavailable           int        `json:"unavailable"`
+		Failed                int        `json:"failed"`
+		Ignored               int        `json:"ignored"`
+		RetryRound            int        `json:"retry_round"`
+		RatePerSecond         float64    `json:"rate_per_second,omitempty"`
+		EstimatedCompletionAt *time.Time `json:"estimated_completion_at,omitempty"`
 	} `json:"download"`
 
 	Cleanup struct {
@@ -475,16 +477,32 @@ func (s *syncStatus) setMirrors(mirrors []mirrorStatus) {
 	s.mirrors = mirrors
 }
 
+func estimateDownloadCompletion(started, observed time.Time, completed, planned int) (*time.Time, float64) {
+	if started.IsZero() || !observed.After(started) || completed <= 0 || planned <= completed {
+		return nil, 0
+	}
+	elapsed := observed.Sub(started)
+	rate := float64(completed) / elapsed.Seconds()
+	remainingSeconds := elapsed.Seconds() * float64(planned-completed) / float64(completed)
+	if remainingSeconds > time.Duration(1<<63-1).Seconds() {
+		return nil, rate
+	}
+	remaining := time.Duration(remainingSeconds * float64(time.Second))
+	estimated := observed.Add(remaining)
+	return &estimated, rate
+}
+
 func (s *syncStatus) snapshot() statusSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	snap := statusSnapshot{
 		Version:         Version,
 		Mode:            s.mode,
 		Phase:           s.phase,
 		PhaseStartedAt:  s.phaseStarted,
 		RoundStartedAt:  s.roundStarted,
-		UpdatedAt:       time.Now(),
+		UpdatedAt:       now,
 		NextRunAt:       s.nextRun,
 		SyncType:        s.syncType,
 		TriggerSource:   s.triggerSource,
@@ -511,6 +529,8 @@ func (s *syncStatus) snapshot() statusSnapshot {
 	snap.Download.Failed = s.downloadFailed
 	snap.Download.Ignored = s.downloadIgnored
 	snap.Download.RetryRound = s.downloadRetryRound
+	completed := s.downloadDownloaded + s.downloadReused + s.downloadUnavailable + s.downloadIgnored
+	snap.Download.EstimatedCompletionAt, snap.Download.RatePerSecond = estimateDownloadCompletion(s.roundStarted, now, completed, max(s.downloadPlanned, completed+s.downloadFailed))
 	snap.Cleanup.Enabled = s.cleanupEnabled
 	snap.Cleanup.Deleted = s.cleanupDeleted
 	snap.Cleanup.GuardTriggered = s.cleanupGuardTriggered
