@@ -496,6 +496,11 @@ func (cfg *Config) runSyncRound(ctx context.Context, s SyncSettings, requested, 
 		globalStatus.setSyncType(effective)
 		return cfg.runSyncRoundOnce(ctx, s, effective, revision)
 	})
+	if pending, err := probePendingFullSync(cfg.DownloadDir); err != nil {
+		slog.Warn("Cannot refresh pending full sync state after round", "error", err)
+	} else {
+		globalStatus.setPending(pending != nil, pending != nil && !s.DownloadEnabled())
+	}
 	switch {
 	case lastErr == nil:
 		return OutcomeSuccess, nil
@@ -512,6 +517,7 @@ func (cfg *Config) runSyncRound(ctx context.Context, s SyncSettings, requested, 
 func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncType string, revision int64) error {
 	var remote []*MetadataFile
 	var ignoredPaths map[string]bool
+	var partialFullErr error
 	if s.DownloadEnabled() {
 		crawler, err := NewMetadataCrawler(ctx, cfg.DownloadDir, s)
 		if err != nil {
@@ -538,10 +544,17 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 		}
 		probeCancel()
 		if syncErr != nil {
-			return &roundError{code: 2, phase: "download", err: syncErr}
+			if !errors.Is(syncErr, errFullSyncPartial) {
+				return &roundError{code: 2, phase: "download", err: syncErr}
+			}
+			partialFullErr = syncErr
+			slog.Warn("Full rebuild remains pending; continuing media sync with successful entries", "error", syncErr)
 		}
 		if !s.MediaEnabled() {
 			slog.Info("Finished download phase; the media stage is disabled by run mode")
+			if partialFullErr != nil {
+				return &roundError{code: 2, phase: "download", err: partialFullErr}
+			}
 			return nil
 		}
 		remote, err = crawler.LocalFiles()
@@ -582,6 +595,9 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 	globalStatus.setPhase(PhaseCopying)
 	if err := cfg.syncMetadata(ctx, s, filesNeedUpdate); err != nil {
 		return &roundError{code: 128, phase: "copy", err: err}
+	}
+	if partialFullErr != nil {
+		return &roundError{code: 2, phase: "download", err: partialFullErr}
 	}
 	return nil
 }

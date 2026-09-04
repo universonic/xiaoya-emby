@@ -88,7 +88,7 @@ func TestParseScanListMalformedLines(t *testing.T) {
 		"2024-01-02 03:04 relative/path.txt",
 		"2024-01-02 03:04 /电影/bad\x00name.txt",
 		"2024-01-02 03:04 /../..",
-		"2024-01-02 03:04 /电影/" + strings.Repeat("x", 5000),
+		"2024-01-02 03:04 /电影/" + strings.Repeat("x", maxManifestPathLen+1),
 		"2024-01-02 03:04 /电影/ok.txt",
 	}, "\n")
 	entries, _, malformed, err := parseScanList(bytes.NewReader(gzipString(t, manifest)), map[string]bool{"电影": true})
@@ -100,6 +100,34 @@ func TestParseScanListMalformedLines(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("entries = %v, want only the valid line", entries)
+	}
+}
+
+func TestParseScanListAllowsPathBeyondPATHMAX(t *testing.T) {
+	longPath := "/电影/" + strings.Repeat(strings.Repeat("d", 200)+"/", 24) + "movie.nfo"
+	manifest := "2024-01-02 03:04 " + longPath + "\n"
+	entries, _, malformed, err := parseScanList(bytes.NewReader(gzipString(t, manifest)), map[string]bool{"电影": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if malformed != 0 || len(entries) != 1 {
+		t.Fatalf("long path parse: malformed=%d entries=%d", malformed, len(entries))
+	}
+}
+
+func TestParseScanListRejectsFileParentConflict(t *testing.T) {
+	manifest := "2024-01-02 03:04 /电影/a\n2024-01-02 03:04 /电影/a/b.nfo\n"
+	_, _, _, err := parseScanList(bytes.NewReader(gzipString(t, manifest)), map[string]bool{"电影": true})
+	if err == nil || !strings.Contains(err.Error(), "conflicts with descendant") {
+		t.Fatalf("err = %v, want file/descendant conflict", err)
+	}
+}
+
+func TestParseScanListRejectsCaseInsensitivePathConflict(t *testing.T) {
+	manifest := "2024-01-02 03:04 /电影/A\n2024-01-02 03:04 /电影/a/b.nfo\n"
+	_, _, _, err := parseScanList(bytes.NewReader(gzipString(t, manifest)), map[string]bool{"电影": true})
+	if err == nil || !strings.Contains(err.Error(), "conflicts with descendant") {
+		t.Fatalf("err = %v, want case-insensitive path conflict", err)
 	}
 }
 
@@ -176,7 +204,7 @@ func TestDownloadRejectsSymlinkEscape(t *testing.T) {
 	}))
 	defer srv.Close()
 	mc.client = srv.Client()
-	_, err := mc.Download(context.Background(), "/电影/out.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true})
+	_, err := mc.Download(context.Background(), "/电影/out.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true, repairParents: true})
 	if err == nil {
 		t.Fatal("download through escaping symlink unexpectedly succeeded")
 	}
@@ -197,6 +225,48 @@ func TestDownloadRejectsOversizedResponse(t *testing.T) {
 	_, err := mc.Download(context.Background(), "/电影/huge.nfo", downloadOpts{mirrors: []string{srv.URL}, expectFile: true})
 	if err == nil || !strings.Contains(err.Error(), "size limit") {
 		t.Fatalf("err = %v, want size limit error", err)
+	}
+}
+
+func TestDownloadSupportsMaxLengthFilename(t *testing.T) {
+	_, mc := newTestCrawlerRoot(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "7")
+		_, _ = w.Write([]byte("payload"))
+	}))
+	defer srv.Close()
+	mc.client = srv.Client()
+
+	name := strings.Repeat("a", 251) + ".nfo"
+	remotePath := "/电影/" + name
+	if _, err := mc.Download(context.Background(), remotePath, downloadOpts{mirrors: []string{srv.URL}, expectFile: true}); err != nil {
+		t.Fatalf("download with 255-byte filename failed: %v", err)
+	}
+	if got, err := mc.fsRoot.ReadFile(rootRel(remotePath)); err != nil || string(got) != "payload" {
+		t.Fatalf("downloaded content = %q, err = %v", got, err)
+	}
+}
+
+func TestDownloadSupportsPathBeyondPATHMAX(t *testing.T) {
+	_, mc := newTestCrawlerRoot(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "7")
+		_, _ = w.Write([]byte("payload"))
+	}))
+	defer srv.Close()
+	mc.client = srv.Client()
+
+	remotePath := "/电影/" + strings.Repeat(strings.Repeat("d", 200)+"/", 24) + "movie.nfo"
+	if len(remotePath) <= 4096 {
+		t.Fatalf("test path is only %d bytes", len(remotePath))
+	}
+	if _, err := mc.Download(context.Background(), remotePath, downloadOpts{mirrors: []string{srv.URL}, expectFile: true}); err != nil {
+		t.Fatalf("download with %d-byte path failed: %v", len(remotePath), err)
+	}
+	if got, err := mc.fsRoot.ReadFile(rootRel(remotePath)); err != nil || string(got) != "payload" {
+		t.Fatalf("downloaded content = %q, err = %v", got, err)
 	}
 }
 
@@ -305,22 +375,20 @@ func TestRootDropsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestTempPathForAndSweep(t *testing.T) {
-	base := t.TempDir()
-	target := filepath.Join(base, "poster.jpg")
+func TestTempPathFor(t *testing.T) {
+	target := filepath.Join("电影", strings.Repeat("a", 251)+".nfo")
 	tmp := tempPathFor(target)
-	if !isOwnTempName(filepath.Base(tmp)) {
-		t.Fatalf("temp name %q not recognized as own", filepath.Base(tmp))
-	}
 	if filepath.Dir(tmp) != filepath.Dir(target) {
-		t.Fatalf("temp file not a sibling of the target: %q", tmp)
+		t.Fatalf("temp file is not beside the target: %q", tmp)
 	}
 	if tempPathFor(target) == tmp {
 		t.Fatal("temp paths must be unique")
 	}
-	// A genuine remote ".tmp" file must never match the sweep pattern.
-	if isOwnTempName("episode1.s01e01.tmp") {
-		t.Fatal("plain .tmp name must not be treated as our temp file")
+	if strings.Contains(filepath.Base(tmp), filepath.Base(target)) {
+		t.Fatalf("temp name %q includes the target name", filepath.Base(tmp))
+	}
+	if len(filepath.Base(tmp)) >= len(filepath.Base(target)) {
+		t.Fatalf("temp basename was not shortened: %q", filepath.Base(tmp))
 	}
 }
 

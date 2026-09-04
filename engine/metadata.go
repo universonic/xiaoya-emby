@@ -50,9 +50,10 @@ const (
 	manifestTimeLayout = "2006-01-02 15:04"
 	// maxScanListBytes guards against absurd manifest downloads.
 	maxScanListBytes = 128 << 20
-	// maxManifestPathLen rejects absurdly long entry paths so a hostile
-	// manifest cannot amplify memory and log usage.
-	maxManifestPathLen = 4096
+	// maxManifestPathLen rejects absurdly long entry paths while allowing
+	// deep paths beyond the traditional PATH_MAX; os.Root resolves them one
+	// component at a time with *at operations.
+	maxManifestPathLen = 64 << 10
 	// maxMetadataFileBytes bounds one metadata response; maxRoundDownloadBytes
 	// bounds cumulative bytes written by one Sync call.
 	maxMetadataFileBytes  int64 = 512 << 20
@@ -200,6 +201,9 @@ type downloadOpts struct {
 	// bytes written (full rebuild rounds); reused rows are only allowed when
 	// the server honors it.
 	identity bool
+	// repairParents allows full rebuilds to replace stale regular files that
+	// obstruct cache directories. Incremental rounds keep tracked paths intact.
+	repairParents bool
 	// filterFn is applied to the response metadata before the body is read;
 	// returning false skips the download.
 	filterFn func(f *MetadataFile) bool
@@ -464,9 +468,7 @@ func (mc *MetadataCrawler) workerCount() int {
 
 // Sync downloads metadata, preferring the manifest-based mode and falling
 // back to HTML crawling when the manifest is unavailable or force crawl is
-// requested. Stale ".xtmp" files are swept by the mode implementations, only
-// when downloads will actually happen, so a no-op manifest run does not pay
-// for a full tree walk.
+// requested.
 func (mc *MetadataCrawler) Sync(ctx context.Context) error {
 	mc.ignoredPaths = nil
 	globalStatus.setCleanupEnabled(mc.cleanup)
@@ -492,7 +494,7 @@ func (mc *MetadataCrawler) Sync(ctx context.Context) error {
 // openRoot opens the rooted filesystem view of downloadDir used by all
 // download/cleanup operations.
 func (mc *MetadataCrawler) openRoot() (*os.Root, error) {
-	if err := os.MkdirAll(mc.downloadDir, dirPerm); err != nil && !os.IsExist(err) {
+	if err := os.MkdirAll(mc.downloadDir, dirPerm); err != nil {
 		return nil, err
 	}
 	root, err := os.OpenRoot(mc.downloadDir)
@@ -549,39 +551,6 @@ func deleteEmptyRootDirs(root *os.Root, dir string) {
 	}
 }
 
-// sweepTempFiles removes stale temporary files left over from interrupted
-// downloads (owned exclusively by this program: names of the form
-// "<target>.xtmp"). Legitimate remote files ending in ".xtmp"
-// are never touched.
-func (mc *MetadataCrawler) sweepTempFiles(ctx context.Context) {
-	if mc.fsRoot == nil {
-		return
-	}
-	for _, root := range mc.selectedPaths {
-		if ctx.Err() != nil {
-			return
-		}
-		dir := rootRel(root)
-		err := fs.WalkDir(mc.fsRoot.FS(), dir, func(name string, entry fs.DirEntry, err error) error {
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil
-				}
-				return err
-			}
-			if !entry.IsDir() && isOwnTempName(entry.Name()) {
-				if err := mc.fsRoot.Remove(name); err == nil {
-					slog.Info("Cleaned up stale temporary file", "path", name)
-				}
-			}
-			return nil
-		})
-		if err != nil && ctx.Err() == nil {
-			slog.Warn("Failed to sweep temporary files", "path", root, "error", err)
-		}
-	}
-}
-
 // reconcileTrash resolves cleanup state left by a crash. A quarantined file
 // whose live files row still exists — or whose path is part of the pending
 // full-sync snapshot (full_previous_files of the current pending sync) — was
@@ -631,7 +600,7 @@ func (mc *MetadataCrawler) reconcileTrash(ctx context.Context, db *sql.DB, pendi
 			} else if !os.IsNotExist(statErr) {
 				return statErr
 			}
-			if err := mc.fsRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil && !os.IsExist(err) {
+			if err := mc.fsRoot.MkdirAll(filepath.Dir(rel), dirPerm); err != nil {
 				return err
 			}
 			if err := renameReplaceCachePath(mc.fsRoot, name, rel); err != nil {
@@ -661,15 +630,52 @@ func (mc *MetadataCrawler) reconcileTrash(ctx context.Context, db *sql.DB, pendi
 
 var ownTempSeq atomic.Uint64
 
-func isOwnTempName(name string) bool {
-	return strings.HasSuffix(name, ".xtmp")
+const ownTempInfix = ".xiaoya-"
+
+// tempPathFor returns a short random basename in the target directory. It
+// replaces rather than extends the target basename, so NAME_MAX is preserved;
+// staying in the same directory also preserves atomic rename across mounts.
+func tempPathFor(filePath string) string {
+	return filepath.Join(filepath.Dir(filePath), "."+newMaterializationID("xiaoya")+".tmp")
 }
 
-// tempPathFor returns a unique sibling temp path for filePath, so two
-// workers downloading the same target never collide and the sweep can tell
-// our temp files apart from genuine ".xtmp" content.
-func tempPathFor(filePath string) string {
-	return fmt.Sprintf("%s-%d.xtmp", filePath, ownTempSeq.Add(1))
+// mkdirAllCachePath repairs non-directory entries that obstruct a directory
+// in the disposable download cache. Media paths deliberately do not use this:
+// replacing an unexpected media file would risk user data.
+func mkdirAllCachePath(root *os.Root, dir string) error {
+	dir = filepath.Clean(dir)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	mkdirErr := root.MkdirAll(dir, dirPerm)
+	if mkdirErr == nil {
+		return nil
+	}
+	parent := filepath.Dir(dir)
+	if parent != "." && parent != dir {
+		if err := mkdirAllCachePath(root, parent); err != nil {
+			return err
+		}
+	}
+	info, err := root.Lstat(dir)
+	switch {
+	case err == nil && info.IsDir():
+		return nil
+	case err == nil && info.Mode().IsRegular():
+		slog.Warn("Replacing file that blocks metadata cache directory", "path", dir)
+		if err := root.Remove(dir); err != nil && !os.IsNotExist(err) {
+			if current, statErr := root.Stat(dir); statErr == nil && current.IsDir() {
+				return nil
+			}
+			return err
+		}
+	case err == nil:
+		return mkdirErr
+	case os.IsNotExist(err):
+	default:
+		return err
+	}
+	return root.MkdirAll(dir, dirPerm)
 }
 
 func isRenameConflict(err error) bool {
@@ -991,10 +997,6 @@ func (mc *MetadataCrawler) syncManifest(ctx context.Context) error {
 	globalStatus.setDownloadPlan(len(entries), len(toDownload))
 	globalStatus.setPhase(PhaseDownloading)
 
-	if len(toDownload) > 0 {
-		mc.sweepTempFiles(ctx)
-	}
-
 	// runRound downloads one round of entries with a fixed-size worker
 	// pool and separates transient failures from entries confirmed absent
 	// on every mirror. Confirmed absences are terminal only for this trigger.
@@ -1311,8 +1313,6 @@ func (mc *MetadataCrawler) syncCrawl(ctx context.Context) error {
 	if err := mc.reconcileTrash(ctx, db, ""); err != nil {
 		return err
 	}
-
-	mc.sweepTempFiles(ctx)
 
 	local, err := mc.localFiles(ctx, db)
 	if err != nil {
@@ -2124,7 +2124,13 @@ func (mc *MetadataCrawler) download(ctx context.Context, mirror, path string, o 
 			return nil, &fsError{errors.New("metadata filesystem root is not open")}
 		}
 		filePath := rootRel(f.Path())
-		if err := mc.fsRoot.MkdirAll(filepath.Dir(filePath), dirPerm); err != nil && !os.IsExist(err) {
+		var err error
+		if o.repairParents {
+			err = mkdirAllCachePath(mc.fsRoot, filepath.Dir(filePath))
+		} else {
+			err = mc.fsRoot.MkdirAll(filepath.Dir(filePath), dirPerm)
+		}
+		if err != nil {
 			return nil, &fsError{err}
 		}
 
@@ -2582,6 +2588,24 @@ func parseScanList(r io.Reader, selectedRoots map[string]bool) (map[string]int64
 	if err != nil {
 		return nil, nil, 0, err
 	}
+	folded := make(map[string]string, len(entries))
+	for p := range entries {
+		key := strings.ToLower(p)
+		if previous, ok := folded[key]; ok && previous != p {
+			return nil, nil, 0, fmt.Errorf("metadata manifest paths %q and %q are aliases on a case-insensitive filesystem", previous, p)
+		}
+		folded[key] = p
+	}
+	for childKey, child := range folded {
+		for i := 1; i < len(childKey); i++ {
+			if childKey[i] != '/' {
+				continue
+			}
+			if parent, ok := folded[childKey[:i]]; ok {
+				return nil, nil, 0, fmt.Errorf("metadata manifest file path %q conflicts with descendant %q", parent, child)
+			}
+		}
+	}
 	return entries, topLevel, malformed, nil
 }
 
@@ -2770,7 +2794,13 @@ func quarantineAndDelete(ctx context.Context, root *os.Root, db *sql.DB, toDelet
 		}
 		fp := rootRel(oldFile.Path())
 		trashPath := filepath.Join(trashDirName, fp)
-		if err := root.MkdirAll(filepath.Dir(trashPath), dirPerm); err != nil && !os.IsExist(err) {
+		if info, err := root.Lstat(fp); err == nil && info.IsDir() {
+			// The old file path became a parent directory. Drop only the stale
+			// row; quarantining this path would remove its current children.
+			markDelete = append(markDelete, oldFile.Path())
+			continue
+		}
+		if err := root.MkdirAll(filepath.Dir(trashPath), dirPerm); err != nil {
 			slog.Warn("Failed to prepare quarantine for stale metadata file", "path", oldFile.Path(), "error", err)
 			continue
 		}

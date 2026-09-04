@@ -510,6 +510,180 @@ func TestSyncFullRelaxedReplacesExistingDirectoryWithFile(t *testing.T) {
 	}
 }
 
+func TestSyncFullRelaxedReplacesExistingFileWithDirectory(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	conflict := filepath.Join(dir, rootRel("/电影/sub"))
+	if err := os.MkdirAll(filepath.Dir(conflict), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(conflict, []byte("stale"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openMetadataDB(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := createFileTable(context.Background(), db); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO files ("+filesTableColumns+") VALUES (?,?,?,?,?,?,?,?)", "/电影/sub", "sub", 5, 1, `"old"`, timeBaseHTTP, `"old":5`, provenanceETag); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	mc := fullCrawlerOver(dir, m1, m2)
+	mc.cleanup = true
+	if err := mc.SyncFull(context.Background(), fullModeRelaxed, 1); err != nil {
+		t.Fatalf("relaxed full failed to repair an obstructed parent directory: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(conflict, "b.nfo"))
+	if err != nil || string(got) != "BBBB" {
+		t.Fatalf("downloaded child content = %q, err = %v", got, err)
+	}
+	db = openTestDB(t, dir)
+	if n := countRows(t, db, "SELECT COUNT(*) FROM files WHERE path = ?", "/电影/sub"); n != 0 {
+		t.Fatalf("stale parent row count = %d", n)
+	}
+}
+
+func TestSyncFullIgnoredFailureStillUpdatesMedia(t *testing.T) {
+	resetGlobalStatus()
+	downloadDir, mediaDir := t.TempDir(), t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	cfg := &Config{DownloadDir: downloadDir, MediaDir: mediaDir}
+	settings := validSettings()
+	settings.RunMode = modeBitDownload | modeBitMedia
+	settings.Purge = false
+	settings.MirrorURL = []string{m1.URL, m2.URL}
+	settings.DownloadWorkers = 2
+
+	if outcome, err := cfg.runSyncRound(context.Background(), settings, SyncTypeFullRelaxed, TriggerManual, 1); err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("initial full sync: outcome=%s err=%v", outcome, err)
+	}
+
+	const newPath = "/电影/new.nfo"
+	updatedManifest := "2024-01-02 03:06 /电影/a.nfo\n" +
+		"2024-01-02 03:05 /电影/sub/b.nfo\n" +
+		"2024-01-02 03:06 " + newPath + "\n"
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, updatedManifest)
+		m.addFile(newPath, "NEW", `"new"`)
+		m.addFile("/电影/a.nfo", "AAAA-new", `"ea-new"`)
+	}
+
+	var failBad atomic.Bool
+	failBad.Store(true)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		inner := m.Server.Config.Handler
+		m.Server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if failBad.Load() && r.Method == http.MethodGet && r.URL.Path == "/电影/a.nfo" {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", "8")
+				_, _ = w.Write([]byte("bad"))
+				return
+			}
+			inner.ServeHTTP(w, r)
+		})
+	}
+
+	oldDelay := metadataRetryBaseDelay
+	metadataRetryBaseDelay = 0
+	t.Cleanup(func() { metadataRetryBaseDelay = oldDelay })
+	outcome, err := cfg.runSyncRound(context.Background(), settings, SyncTypeFullRelaxed, TriggerManual, 2)
+	if outcome != OutcomeSuccess || err != nil {
+		t.Fatalf("full sync with ignored entry: outcome=%s err=%v", outcome, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(mediaDir, rootRel(newPath))); err != nil || string(got) != "NEW" {
+		t.Fatalf("successful new media file = %q, err=%v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(mediaDir, rootRel("/电影/a.nfo"))); err != nil || string(got) != "AAA" {
+		t.Fatalf("failed media file was not preserved: %q, err=%v", got, err)
+	}
+	db := openTestDB(t, downloadDir)
+	if st, err := readFullSyncStateDB(context.Background(), db); err != nil || st != nil {
+		t.Fatalf("full rebuild state = %+v, err=%v", st, err)
+	}
+	if snap := globalStatus.snapshot(); snap.Download.Ignored != 1 || snap.Download.Failed != 0 || snap.PendingRecovery {
+		t.Fatalf("ignored-entry counters = %+v pending=%v", snap.Download, snap.PendingRecovery)
+	}
+	if marker, err := getMeta(context.Background(), db, metaScanListHash); err != nil || marker != "" {
+		t.Fatalf("ignored rebuild published manifest marker %q, err=%v", marker, err)
+	}
+
+	failBad.Store(false)
+	outcome, err = cfg.runSyncRound(context.Background(), settings, SyncTypeIncremental, TriggerManual, 3)
+	if err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("incremental recovery: outcome=%s err=%v", outcome, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(mediaDir, rootRel("/电影/a.nfo"))); err != nil || string(got) != "AAAA-new" {
+		t.Fatalf("recovered media file = %q, err=%v", got, err)
+	}
+	if globalStatus.snapshot().PendingRecovery {
+		t.Fatal("status reports pending recovery after completion")
+	}
+}
+
+func TestSyncFullCrawlFailureStillUpdatesMediaAndRemainsRecoverable(t *testing.T) {
+	resetGlobalStatus()
+	downloadDir, mediaDir := t.TempDir(), t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	var failCrawl atomic.Bool
+	failCrawl.Store(true)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		inner := m.Server.Config.Handler
+		m.Server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if failCrawl.Load() && r.Method == http.MethodGet && r.URL.Path == "/115/c.nfo" {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", "2")
+				_, _ = w.Write([]byte("C"))
+				return
+			}
+			inner.ServeHTTP(w, r)
+		})
+	}
+
+	cfg := &Config{DownloadDir: downloadDir, MediaDir: mediaDir}
+	settings := validSettings()
+	settings.RunMode = modeBitDownload | modeBitMedia
+	settings.Purge = false
+	settings.MirrorURL = []string{m1.URL, m2.URL}
+	settings.DownloadWorkers = 2
+	oldDelay := metadataRetryBaseDelay
+	metadataRetryBaseDelay = 0
+	t.Cleanup(func() { metadataRetryBaseDelay = oldDelay })
+
+	outcome, err := cfg.runSyncRound(context.Background(), settings, SyncTypeFullRelaxed, TriggerManual, 1)
+	if outcome != OutcomeDeferred || !errors.Is(err, errFullSyncPartial) {
+		t.Fatalf("full sync with crawl failure: outcome=%s err=%v", outcome, err)
+	}
+	for path, want := range map[string]string{"/电影/a.nfo": "AAA", "/电影/sub/b.nfo": "BBBB"} {
+		if got, err := os.ReadFile(filepath.Join(mediaDir, rootRel(path))); err != nil || string(got) != want {
+			t.Fatalf("successful media file %s = %q, err=%v", path, got, err)
+		}
+	}
+	if !globalStatus.snapshot().PendingRecovery {
+		t.Fatal("crawl failure did not leave recoverable full state")
+	}
+
+	failCrawl.Store(false)
+	outcome, err = cfg.runSyncRound(context.Background(), settings, SyncTypeIncremental, TriggerManual, 2)
+	if err != nil || outcome != OutcomeSuccess {
+		t.Fatalf("crawl recovery: outcome=%s err=%v", outcome, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(mediaDir, rootRel("/115/c.nfo"))); err != nil || string(got) != "C" {
+		t.Fatalf("recovered crawl media file = %q, err=%v", got, err)
+	}
+	if globalStatus.snapshot().PendingRecovery {
+		t.Fatal("status still reports pending after crawl recovery")
+	}
+}
+
 func TestRenameConflictRecognizesLinuxFileOverDirectoryError(t *testing.T) {
 	if !isRenameConflict(&os.LinkError{Op: "rename", Old: "old", New: "new", Err: syscall.EISDIR}) {
 		t.Fatal("EISDIR must trigger the existing-target replacement path")
@@ -883,6 +1057,50 @@ func TestSyncFullRequiresTwoAgreeingManifestMirrors(t *testing.T) {
 	}
 	if n := countRows(t, db, "SELECT COUNT(*) FROM files"); n != 0 {
 		t.Fatalf("deferred attempts wrote rows: %d", n)
+	}
+}
+
+func TestSyncFullRejectsFileParentConflictBeforeClearing(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, "2024-01-02 03:04 /电影/a\n2024-01-02 03:04 /电影/a/b.nfo\n")
+		m.addFile("/电影/a", "A", `"a"`)
+		m.addFile("/电影/a/b.nfo", "B", `"b"`)
+	}
+	stale := filepath.Join(dir, "电影", "keep.nfo")
+	if err := os.MkdirAll(filepath.Dir(stale), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("keep"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	err := fullCrawlerOver(dir, m1, m2).SyncFull(context.Background(), fullModeStrict, 1)
+	if !isDeferredErr(err) || !strings.Contains(err.Error(), "conflicts with descendant") {
+		t.Fatalf("conflicting inventory err = %v", err)
+	}
+	if got, err := os.ReadFile(stale); err != nil || string(got) != "keep" {
+		t.Fatalf("strict clearing ran before conflict rejection: %q, err=%v", got, err)
+	}
+	db := openTestDB(t, dir)
+	if st, err := readFullSyncStateDB(context.Background(), db); err != nil || st != nil {
+		t.Fatalf("conflicting inventory wrote full state: %+v, err=%v", st, err)
+	}
+}
+
+func TestSyncFullRejectsCaseInsensitivePathConflict(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	m1, m2 := dualManifestMirrors(t)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, "2024-01-02 03:04 /电影/A\n2024-01-02 03:04 /电影/a/b.nfo\n")
+	}
+
+	err := fullCrawlerOver(dir, m1, m2).SyncFull(context.Background(), fullModeStrict, 1)
+	if !isDeferredErr(err) || !strings.Contains(err.Error(), "conflicts with descendant") {
+		t.Fatalf("case-insensitive conflicting inventory err = %v", err)
 	}
 }
 

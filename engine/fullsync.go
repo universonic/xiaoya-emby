@@ -46,6 +46,10 @@ const (
 // of busy-retrying.
 var errInventoryDeferred = fmt.Errorf("%w: full inventory unavailable", errDeferred)
 
+// errFullSyncPartial keeps crawl-sourced failures recoverable while allowing
+// the controller to copy this round's successful entries to media.
+var errFullSyncPartial = fmt.Errorf("%w: full rebuild has pending crawl entries", errDeferred)
+
 // fullSyncState is the versioned state machine of a (possibly interrupted)
 // full rebuild. The sync ID stays stable from start to final commit; the
 // inventory run ID is replaced whenever a recovery round re-validates a new
@@ -138,6 +142,7 @@ func createFullTables(ctx context.Context, db *sql.DB) error {
 			PRIMARY KEY (inventory_run_id, path)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_full_inventory_run ON full_inventory (inventory_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_full_inventory_run_fold ON full_inventory (inventory_run_id, lower(path))`,
 		`CREATE TABLE IF NOT EXISTS full_previous_files (
 			sync_id TEXT NOT NULL,
 			path TEXT NOT NULL,
@@ -370,6 +375,39 @@ func (mc *MetadataCrawler) buildInventory(ctx context.Context, db *sql.DB, force
 	}
 	if count == 0 {
 		return nil, fmt.Errorf("%w: inventory is empty", errInventoryDeferred)
+	}
+	// Use case-folded keys because the same cache and media trees must also be
+	// representable on the case-insensitive filesystems supported by the app.
+	var parentPath, childPath string
+	err := db.QueryRowContext(ctx, `
+		SELECT first.path, second.path
+		FROM full_inventory AS first
+		JOIN full_inventory AS second
+		  ON second.inventory_run_id = first.inventory_run_id
+		 AND lower(second.path) = lower(first.path)
+		 AND second.path != first.path
+		WHERE first.inventory_run_id = ?
+		LIMIT 1`, runID).Scan(&parentPath, &childPath)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err == nil {
+		return nil, fmt.Errorf("%w: paths %q and %q are aliases on a case-insensitive filesystem", errInventoryDeferred, parentPath, childPath)
+	}
+	err = db.QueryRowContext(ctx, `
+		SELECT parent.path, child.path
+		FROM full_inventory AS parent
+		JOIN full_inventory AS child
+		  ON child.inventory_run_id = parent.inventory_run_id
+		 AND lower(child.path) >= lower(parent.path) || '/'
+		 AND lower(child.path) < lower(parent.path) || '0'
+		WHERE parent.inventory_run_id = ?
+		LIMIT 1`, runID).Scan(&parentPath, &childPath)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err == nil {
+		return nil, fmt.Errorf("%w: file path %q conflicts with descendant %q", errInventoryDeferred, parentPath, childPath)
 	}
 	result.Count = count
 
@@ -718,6 +756,7 @@ func (mc *MetadataCrawler) runFullPages(
 	ctx context.Context,
 	db *sql.DB,
 	st *fullSyncState,
+	inv *inventoryResult,
 	strict bool,
 ) error {
 	processEntry := func(ctx context.Context, e invEntry, files chan<- *MetadataFile) error {
@@ -742,11 +781,12 @@ func (mc *MetadataCrawler) runFullPages(
 				}
 			}
 			file, err := mc.Download(ctx, e.path, downloadOpts{
-				mirrors:    mc.invMirrors(e.source),
-				modified:   manifestModified(e),
-				expectFile: true,
-				timeBase:   e.timeBase,
-				identity:   true,
+				mirrors:       mc.invMirrors(e.source),
+				modified:      manifestModified(e),
+				expectFile:    true,
+				timeBase:      e.timeBase,
+				identity:      true,
+				repairParents: true,
 			})
 			if err != nil {
 				return err
@@ -812,18 +852,56 @@ func (mc *MetadataCrawler) runFullPages(
 		}
 		failed = append(failed, pageBad...)
 	}
+	globalStatus.setFailed(len(failed))
 
-	// Bounded retries for transient per-entry failures. A vanished entry
-	// (404 on every mirror) fails the whole round instead of leaving a
-	// silent gap in the cache.
+	// Bounded retries for transient per-entry failures. Entries still failing
+	// at the limit are explicitly ignored so successful entries continue to
+	// media without publishing a complete-manifest marker.
 	for retry := 0; len(failed) > 0; retry++ {
-		if retry >= 5 {
-			return fmt.Errorf("full rebuild entries failed after maximum retries: %d pending", len(failed))
+		if retry >= maxMetadataEntryRetryRounds {
+			hasCrawlFailure := false
+			for _, e := range failed {
+				mc.markIgnored(e.path)
+				hasCrawlFailure = hasCrawlFailure || e.source == "crawl"
+			}
+			globalStatus.addIgnored(len(failed))
+			globalStatus.setFailed(0)
+			if hasCrawlFailure {
+				return fmt.Errorf("%w: %d entries failed after maximum retries", errFullSyncPartial, len(failed))
+			}
+
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			stmt, err := tx.PrepareContext(ctx, "DELETE FROM full_inventory WHERE inventory_run_id = ? AND path = ?")
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+			for _, e := range failed {
+				if _, err := stmt.ExecContext(ctx, st.InventoryRunID, e.path); err != nil {
+					stmt.Close()
+					tx.Rollback()
+					return err
+				}
+			}
+			stmt.Close()
+			if _, err := tx.ExecContext(ctx, "UPDATE full_inventory_runs SET entry_count = entry_count - ? WHERE run_id = ?", len(failed), st.InventoryRunID); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			inv.Count -= len(failed)
+			slog.Warn("Ignoring full rebuild entries after maximum retries; successful entries will continue to media", "count", len(failed))
+			return nil
 		}
 		if retry > 0 {
 			slog.Info("Failed full rebuild entries will be retried...", "count", len(failed))
 			globalStatus.setRetryRound(retry)
-			if err := sleepContext(ctx, time.Duration(1<<min(retry, 5))*time.Second); err != nil {
+			if err := sleepContext(ctx, time.Duration(1<<min(retry, maxMetadataEntryRetryRounds))*metadataRetryBaseDelay); err != nil {
 				return err
 			}
 		}
@@ -875,6 +953,7 @@ func (mc *MetadataCrawler) runFullPages(
 			return ctx.Err()
 		}
 		failed = next
+		globalStatus.setFailed(len(failed))
 	}
 	return nil
 }
@@ -940,11 +1019,12 @@ func (mc *MetadataCrawler) relaxedEntry(ctx context.Context, e invEntry, files c
 		}
 	}
 	file, err := mc.Download(ctx, e.path, downloadOpts{
-		mirrors:    mc.invMirrors(e.source),
-		modified:   manifestModified(e),
-		expectFile: true,
-		timeBase:   e.timeBase,
-		identity:   true,
+		mirrors:       mc.invMirrors(e.source),
+		modified:      manifestModified(e),
+		expectFile:    true,
+		timeBase:      e.timeBase,
+		identity:      true,
+		repairParents: true,
 	})
 	if err != nil {
 		return err
@@ -959,13 +1039,13 @@ func (mc *MetadataCrawler) relaxedEntry(ctx context.Context, e invEntry, files c
 func (mc *MetadataCrawler) processStrictFull(ctx context.Context, db *sql.DB, st *fullSyncState, inv *inventoryResult) error {
 	globalStatus.setPhase(PhaseDownloading)
 	slog.Info("Strict full rebuild downloading", "inventory", inv.Count)
-	return mc.runFullPages(ctx, db, st, true)
+	return mc.runFullPages(ctx, db, st, inv, true)
 }
 
 func (mc *MetadataCrawler) processRelaxedFull(ctx context.Context, db *sql.DB, st *fullSyncState, inv *inventoryResult) error {
 	globalStatus.setPhase(PhaseRebuilding)
 	slog.Info("Relaxed full rebuild reusing/downloading", "inventory", inv.Count)
-	return mc.runFullPages(ctx, db, st, false)
+	return mc.runFullPages(ctx, db, st, inv, false)
 }
 
 // pageFullDiff reads one keyset page of the distinct deletion diff. SQL's
@@ -1032,8 +1112,17 @@ func (mc *MetadataCrawler) finalizeFull(ctx context.Context, db *sql.DB, st *ful
 			}
 			after = page[len(page)-1]
 			for _, p := range page {
+				if mc.ignoredPaths[p] {
+					continue
+				}
 				fp := rootRel(p)
 				trashPath := filepath.Join(trashDirName, fp)
+				if info, err := mc.fsRoot.Lstat(fp); err == nil && info.IsDir() {
+					// A stale file path can become a parent directory in the new
+					// inventory. Preserve that directory and its downloaded children.
+					deleted++
+					continue
+				}
 				if err := mc.fsRoot.MkdirAll(filepath.Dir(trashPath), dirPerm); err != nil {
 					return err
 				}
@@ -1083,13 +1172,17 @@ func (mc *MetadataCrawler) finalizeFull(ctx context.Context, db *sql.DB, st *ful
 			tx.Rollback()
 			return err
 		}
-		if err := setMeta(ctx, tx, metaScanListHash, inv.ManifestHash); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := setMeta(ctx, tx, metaScanListLastModified, inv.ManifestLastMod); err != nil {
-			tx.Rollback()
-			return err
+		// An ignored manifest entry must be retried by the next incremental
+		// round, so only complete rebuilds may publish short-circuit markers.
+		if len(mc.ignoredPaths) == 0 {
+			if err := setMeta(ctx, tx, metaScanListHash, inv.ManifestHash); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if err := setMeta(ctx, tx, metaScanListLastModified, inv.ManifestLastMod); err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
 		covered := inv.CoveredRoots
 		if covered == nil {
