@@ -290,7 +290,6 @@ const OUTCOMES = {
 const MIRROR_STATES = {
   "fresh": ["最新", "ok"], "stale": ["清单过期", "warn"], "crawl-only": ["仅爬取", ""], "invalid": ["失效", "err"],
 };
-const INDET_PHASES = new Set(["starting", "probing", "downloading-manifest", "parsing-manifest", "inventory", "clearing-cache", "cleanup"]);
 let lastSeq = 0, lastUpdated = null, cached = [];
 let cfgRevision = null;
 let statusRequestSeq = 0, configRequestSeq = 0;
@@ -615,7 +614,7 @@ async function pollStatus() {
   const d = st.download, unavailable = d.unavailable || 0, ignored = d.ignored || 0;
   const completed = d.downloaded + d.reused + unavailable + ignored;
   const planned = Math.max(d.planned, completed + d.failed);
-  const showProgress = st.running && planned > 0;
+  const waitingForProgress = st.running && planned === 0 && d.total === 0;
   const latest = !st.running && st.history && st.history.length ? st.history[0] : null;
   const bar = $("bar"), track = bar.parentElement;
   let trackCls = "progress", fillCls = "fill", label = "-", width = 0;
@@ -630,20 +629,19 @@ async function pollStatus() {
       fillCls += " warn";
       label = "本轮同步失败，请查看历史或日志";
     }
-  } else if (st.running && !showProgress && INDET_PHASES.has(st.phase)) {
+  } else if (waitingForProgress) {
     trackCls = "progress indeterminate";
-    label = (PHASES[st.phase] || st.phase) + "…";
+    label = `已处理 ${completed} 个文件 / 总数统计中…`;
   } else {
     const pct = planned > 0 ? Math.min(100, Math.round(completed / planned * 100)) : (d.total > 0 ? 100 : 0);
     width = pct;
     if (planned > 0) {
       if (pct >= 100) {
         fillCls += d.failed > 0 ? " warn" : " done";
-        label = `完成：${completed} / ${planned}` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (ignored > 0 ? ` · 忽略 ${ignored}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
       } else {
         fillCls += d.failed > 0 ? " warn active" : " active";
-        label = `${completed} / ${planned}（${pct}%）` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (ignored > 0 ? ` · 忽略 ${ignored}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
       }
+      label = `已处理 ${completed} / ${planned} 个文件（${pct}%）` + (unavailable > 0 ? ` · 远端不存在 ${unavailable}` : "") + (ignored > 0 ? ` · 忽略 ${ignored}` : "") + (d.failed > 0 ? ` · 失败 ${d.failed}` : "");
     } else if (d.total > 0) {
       fillCls += " done";
       label = st.manifest.short_circuit ? "清单未变化，本轮跳过下载" : "无待下载";
@@ -653,7 +651,7 @@ async function pollStatus() {
   }
   track.className = trackCls;
   bar.className = fillCls;
-  bar.style.width = st.running && !showProgress && INDET_PHASES.has(st.phase) ? "" : width + "%";
+  bar.style.width = waitingForProgress ? "" : width + "%";
   $("barlabel").textContent = label;
   $("d-total").textContent = d.total || "-";
   $("d-planned").textContent = d.planned || "0";

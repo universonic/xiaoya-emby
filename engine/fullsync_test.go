@@ -1091,16 +1091,58 @@ func TestSyncFullRejectsFileParentConflictBeforeClearing(t *testing.T) {
 }
 
 func TestSyncFullRejectsCaseInsensitivePathConflict(t *testing.T) {
-	resetGlobalStatus()
-	dir := t.TempDir()
-	m1, m2 := dualManifestMirrors(t)
-	for _, m := range []*mirrorTestServer{m1, m2} {
-		m.setManifest(t, "2024-01-02 03:04 /电影/A\n2024-01-02 03:04 /电影/a/b.nfo\n")
-	}
+	for _, tc := range []struct {
+		name, secondPath, message string
+	}{
+		{"descendant", "/电影/a/b.nfo", "conflicts with descendant"},
+		{"alias", "/电影/a", "aliases on a case-insensitive filesystem"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGlobalStatus()
+			dir := t.TempDir()
+			m1, m2 := dualManifestMirrors(t)
+			for _, m := range []*mirrorTestServer{m1, m2} {
+				m.setManifest(t, "2024-01-02 03:04 /电影/A\n2024-01-02 03:04 "+tc.secondPath+"\n")
+			}
 
-	err := fullCrawlerOver(dir, m1, m2).SyncFull(context.Background(), fullModeStrict, 1)
-	if !isDeferredErr(err) || !strings.Contains(err.Error(), "conflicts with descendant") {
-		t.Fatalf("case-insensitive conflicting inventory err = %v", err)
+			err := fullCrawlerOver(dir, m1, m2).SyncFull(context.Background(), fullModeStrict, 1)
+			if !isDeferredErr(err) || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("case-insensitive conflicting inventory err = %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildInventoryLargeManifest(t *testing.T) {
+	resetGlobalStatus()
+	const entries = 20_000
+	var manifest strings.Builder
+	for i := range entries {
+		fmt.Fprintf(&manifest, "2024-01-02 03:04 /电影/%06d.nfo\n", i)
+	}
+	m1, m2 := newMirrorServer(t), newMirrorServer(t)
+	for _, m := range []*mirrorTestServer{m1, m2} {
+		m.setManifest(t, manifest.String())
+	}
+	dir := t.TempDir()
+	db := openTestDB(t, dir)
+	if err := createFullTables(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	mc := fullCrawlerOver(dir, m1, m2)
+	mc.selectedPaths = []string{"/电影"}
+	// A quadratic alias check cannot finish this inventory within the budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	inv, err := mc.buildInventory(ctx, db, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.Count != entries {
+		t.Fatalf("inventory count = %d, want %d", inv.Count, entries)
+	}
+	if got := globalStatus.snapshot().Download.Planned; got != entries {
+		t.Fatalf("download plan = %d, want %d", got, entries)
 	}
 }
 

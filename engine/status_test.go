@@ -227,9 +227,13 @@ func TestStatusHTTPHandlers(t *testing.T) {
 	if !strings.Contains(body.String(), "同步状态") {
 		t.Fatal("index page content missing")
 	}
-	if !strings.Contains(body.String(), "const showProgress = st.running && planned > 0") ||
-		!strings.Contains(body.String(), "st.running && !showProgress && INDET_PHASES.has(st.phase)") {
-		t.Fatal("status page no longer prioritizes an active download plan over indeterminate phases")
+	if !strings.Contains(body.String(), "const waitingForProgress = st.running && planned === 0 && d.total === 0") ||
+		!strings.Contains(body.String(), "已处理 ${completed} 个文件 / 总数统计中…") ||
+		!strings.Contains(body.String(), "已处理 ${completed} / ${planned} 个文件（${pct}%）") ||
+		!strings.Contains(body.String(), `bar.style.width = waitingForProgress ? "" : width + "%"`) ||
+		strings.Contains(body.String(), "INDET_PHASES") ||
+		strings.Contains(body.String(), "label = (PHASES[st.phase]") {
+		t.Fatal("progress bar must show sync progress independently of mirror phases")
 	}
 	if !strings.Contains(body.String(), "d.estimated_completion_at") ||
 		!strings.Contains(body.String(), "Math.max(0, observedMs - startedMs)") {

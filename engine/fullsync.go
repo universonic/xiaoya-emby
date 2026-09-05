@@ -378,15 +378,15 @@ func (mc *MetadataCrawler) buildInventory(ctx context.Context, db *sql.DB, force
 	}
 	// Use case-folded keys because the same cache and media trees must also be
 	// representable on the case-insensitive filesystems supported by the app.
+	// Group on the folded index: a self-join can select the covering primary
+	// key instead and compare every pair of paths in a large inventory.
 	var parentPath, childPath string
 	err := db.QueryRowContext(ctx, `
-		SELECT first.path, second.path
-		FROM full_inventory AS first
-		JOIN full_inventory AS second
-		  ON second.inventory_run_id = first.inventory_run_id
-		 AND lower(second.path) = lower(first.path)
-		 AND second.path != first.path
-		WHERE first.inventory_run_id = ?
+		SELECT min(path), max(path)
+		FROM full_inventory
+		WHERE inventory_run_id = ?
+		GROUP BY lower(path)
+		HAVING count(*) > 1
 		LIMIT 1`, runID).Scan(&parentPath, &childPath)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err

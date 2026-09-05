@@ -281,6 +281,35 @@ func TestProbeRejectsFutureManifestTimestamp(t *testing.T) {
 	}
 }
 
+func TestMirrorReprobePreservesSyncPhase(t *testing.T) {
+	resetGlobalStatus()
+	mirror := newMirrorServer(t)
+	mirror.setManifest(t, strictManifest)
+	mc, err := NewMetadataCrawler(context.Background(), t.TempDir(), SyncSettings{MirrorURL: []string{mirror.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := globalStatus.snapshot().Phase; got != PhaseProbing {
+		t.Fatalf("initial phase = %q, want probing", got)
+	}
+	for _, phase := range []string{PhaseInventory, PhaseDownloading, PhaseRebuilding, PhaseSleeping} {
+		t.Run(phase, func(t *testing.T) {
+			globalStatus.setPhase(phase)
+			before := globalStatus.snapshot()
+			if err := mc.validateMirrors(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			after := globalStatus.snapshot()
+			if after.Phase != phase || !after.PhaseStartedAt.Equal(before.PhaseStartedAt) {
+				t.Fatalf("mirror refresh changed phase %q to %q or reset its start time", phase, after.Phase)
+			}
+			if len(after.Mirrors) != 1 || after.Mirrors[0].State != mirrorStateFresh {
+				t.Fatalf("mirror refresh did not publish results: %+v", after.Mirrors)
+			}
+		})
+	}
+}
+
 func TestReconcileTrashRestoresUncommittedDeletion(t *testing.T) {
 	base, mc := newTestCrawlerRoot(t)
 	db, err := openMetadataDB(base)

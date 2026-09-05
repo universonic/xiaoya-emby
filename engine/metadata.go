@@ -244,6 +244,8 @@ func NewMetadataCrawler(ctx context.Context, downloadDir string, s SyncSettings)
 	} else {
 		mc.mirrors = append([]string(nil), s.MirrorURL...)
 	}
+	// Background mirror refreshes must not overwrite the active sync phase.
+	globalStatus.setPhase(PhaseProbing)
 	var err error
 	for range 3 {
 		if err = mc.validateMirrors(ctx); err == nil {
@@ -313,7 +315,6 @@ LOOP:
 // newest manifest form the manifest pool; all HTML-valid mirrors (including
 // manifest-capable ones) form the crawl pool used for fallback.
 func (mc *MetadataCrawler) validateMirrors(ctx context.Context) error {
-	globalStatus.setPhase(PhaseProbing)
 	slog.Info("Validating metadata mirrors...")
 	probes := make([]mirrorProbe, len(mc.mirrors))
 	var wg sync.WaitGroup
