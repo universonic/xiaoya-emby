@@ -16,6 +16,11 @@ import (
 // run because the download stage is disabled in the current run mode.
 var errRecoveryPaused = errors.New("pending full rebuild recovery is paused: the download stage is disabled")
 
+// errMediaDisabled reports that a metadata repair was requested while the
+// media sync stage is disabled in the current run mode; repair has nothing
+// to compare against or write to without it.
+var errMediaDisabled = errors.New("metadata repair requires the media sync stage to be enabled")
+
 const (
 	maxAutomaticRoundRetries = 3
 	automaticRoundRetryDelay = 5 * time.Second
@@ -277,7 +282,7 @@ var (
 
 func (c *Controller) handleTrigger(syncType string, confirm bool) controllerReply {
 	switch syncType {
-	case SyncTypeIncremental, SyncTypeFullRelaxed, SyncTypeFullStrict:
+	case SyncTypeIncremental, SyncTypeFullRelaxed, SyncTypeFullStrict, SyncTypeRepair:
 	default:
 		return controllerReply{err: fmt.Errorf("unknown sync type %q", syncType)}
 	}
@@ -291,7 +296,9 @@ func (c *Controller) handleTrigger(syncType string, confirm bool) controllerRepl
 	}
 	paused := pending != nil && !settings.DownloadEnabled()
 	globalStatus.setPending(pending != nil, paused)
-	if paused {
+	// Repair always skips the download phase, so a paused recovery (or its
+	// mode override below) never applies to it.
+	if paused && syncType != SyncTypeRepair {
 		return controllerReply{err: fmt.Errorf("%w", errRecoveryPaused)}
 	}
 	if (syncType == SyncTypeFullRelaxed || syncType == SyncTypeFullStrict) && !settings.DownloadEnabled() {
@@ -300,8 +307,11 @@ func (c *Controller) handleTrigger(syncType string, confirm bool) controllerRepl
 	if syncType == SyncTypeFullStrict && !confirm {
 		return controllerReply{err: errConfirm}
 	}
+	if syncType == SyncTypeRepair && !settings.MediaEnabled() {
+		return controllerReply{err: errMediaDisabled}
+	}
 	effective := syncType
-	if pending != nil {
+	if pending != nil && syncType != SyncTypeRepair {
 		effective = pending.syncType()
 	}
 	job := c.launchJob(syncType, effective, TriggerManual, settings)
@@ -483,11 +493,13 @@ func (cfg *Config) runSyncRound(ctx context.Context, s SyncSettings, requested, 
 		}
 		paused := pending != nil && !s.DownloadEnabled()
 		globalStatus.setPending(pending != nil, paused)
-		if paused {
+		// Repair always skips the download phase, so a paused recovery (or
+		// its mode override below) never applies to it.
+		if paused && requested != SyncTypeRepair {
 			return fmt.Errorf("%w: %w", errDeferred, errRecoveryPaused)
 		}
 		effective := requested
-		if pending != nil {
+		if pending != nil && requested != SyncTypeRepair {
 			effective = pending.syncType()
 			if requested != effective {
 				slog.Info("Requested sync mode is overridden by pending full rebuild recovery", "requested", requested, "effective", effective)
@@ -518,7 +530,7 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 	var remote []*MetadataFile
 	var ignoredPaths map[string]bool
 	var partialFullErr error
-	if s.DownloadEnabled() {
+	if s.DownloadEnabled() && syncType != SyncTypeRepair {
 		crawler, err := NewMetadataCrawler(ctx, cfg.DownloadDir, s)
 		if err != nil {
 			return &roundError{code: 2, phase: "download", err: err}
@@ -569,7 +581,11 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 		if err != nil {
 			return &roundError{code: 2, phase: "download", err: err}
 		}
-		slog.Info("Skipped metadata download.")
+		if syncType == SyncTypeRepair {
+			slog.Info("Skipped metadata download (repair mode).")
+		} else {
+			slog.Info("Skipped metadata download.")
+		}
 	}
 	if !s.MediaEnabled() {
 		return nil
@@ -586,7 +602,7 @@ func (cfg *Config) runSyncRoundOnce(ctx context.Context, s SyncSettings, syncTyp
 	slog.Info("Metadata files to sync", "count", len(filesToPreserve))
 
 	globalStatus.setPhase(PhasePreparing)
-	filesNeedUpdate, err := cfg.prepareMetadataUpdate(ctx, s, filesToPreserve)
+	filesNeedUpdate, err := cfg.prepareMetadataUpdate(ctx, s, filesToPreserve, syncType == SyncTypeRepair)
 	if err != nil {
 		return &roundError{code: 127, phase: "prepare", err: err}
 	}

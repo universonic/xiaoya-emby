@@ -252,7 +252,7 @@ func TestPrepareMetadataUpdateContentIDSkip(t *testing.T) {
 		&MetadataFile{path: "/电影/a.nfo", name: "a.nfo", size: 10, modified: 100, etag: `"ea"`, timeBase: timeBaseHTTP, contentID: `"ea":10`, provenance: provenanceETag},
 	)
 	preserve := map[string]bool{"/电影/a.nfo": true}
-	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve)
+	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestPrepareMetadataUpdateUnknownBaseCopiesConservatively(t *testing.T) {
 		t.Fatal(err)
 	}
 	preserve := map[string]bool{"/电影/a.nfo": true}
-	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve)
+	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestPrepareMetadataUpdateSameBaseComparesTimes(t *testing.T) {
 		&MetadataFile{path: "/电影/a.nfo", name: "a.nfo", size: 10, modified: 100, etag: `"ea"`, timeBase: timeBaseManifest, contentID: `"ea":10`, provenance: provenanceETag},
 	)
 	preserve := map[string]bool{"/电影/a.nfo": true}
-	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve)
+	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestPrepareMetadataUpdateSameBaseComparesTimes(t *testing.T) {
 		&MetadataFile{path: "/电影/a.nfo", name: "a.nfo", size: 10, modified: 100, etag: `"ea2"`, timeBase: timeBaseManifest, contentID: `"ea2":10`, provenance: provenanceETag},
 		&MetadataFile{path: "/电影/a.nfo", name: "a.nfo", size: 10, modified: 500, etag: `"ea"`, timeBase: timeBaseManifest, contentID: `"ea":10`, provenance: provenanceETag},
 	)
-	need2, err := cfg2.prepareMetadataUpdate(context.Background(), s2, preserve)
+	need2, err := cfg2.prepareMetadataUpdate(context.Background(), s2, preserve, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestPrepareMetadataUpdateEmptyIDsNeverEqual(t *testing.T) {
 		&MetadataFile{path: "/电影/a.nfo", name: "a.nfo", size: 10, modified: 500, etag: "", timeBase: timeBaseHTTP},
 	)
 	preserve := map[string]bool{"/电影/a.nfo": true}
-	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve)
+	need, err := cfg.prepareMetadataUpdate(context.Background(), s, preserve, false)
 	if err != nil {
 		t.Fatal(err)
 	}

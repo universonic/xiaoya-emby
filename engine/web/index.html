@@ -138,6 +138,7 @@
         </select>
       </label>
       <button class="primary" id="trigger" disabled>触发同步</button>
+      <button id="repair" disabled>修复媒体库</button>
       <button class="danger" id="abort" disabled>中止当前任务</button>
       <span class="jobstate" id="job-state">-</span>
     </div>
@@ -282,7 +283,7 @@ const PHASES = {
   "copying": "同步到媒体库", "cleanup": "清理过期文件", "sleeping": "休眠等待下次调度",
   "idle": "空闲",
 };
-const SYNC_TYPES = { "incremental": "增量", "full-relaxed": "宽松全量", "full-strict": "严格全量" };
+const SYNC_TYPES = { "incremental": "增量", "full-relaxed": "宽松全量", "full-strict": "严格全量", "repair": "修复媒体库" };
 const TRIGGERS = { "startup": "启动", "cron": "定时", "manual": "手动" };
 const OUTCOMES = {
   "success": ["成功", "ok"], "failed": ["失败", "err"], "canceled": ["已中止", "warn"], "deferred": ["等待条件", "warn"],
@@ -532,6 +533,8 @@ function renderOps(st) {
   const running = st.running;
   const canWrite = control.available && !control.read_only && authenticated && !opsSubmitting;
   $("trigger").disabled = !canWrite || running;
+  const mediaOn = window.__cfgMode === undefined || !!(window.__cfgMode & 1);
+  $("repair").disabled = !canWrite || running || !mediaOn;
   $("abort").disabled = !canWrite || !running;
   $("sync-type").disabled = !canWrite || running;
   $("token").disabled = !control.available || control.read_only;
@@ -615,6 +618,7 @@ async function pollStatus() {
   const completed = d.downloaded + d.reused + unavailable + ignored;
   const planned = Math.max(d.planned, completed + d.failed);
   const waitingForProgress = st.running && planned === 0 && d.total === 0;
+  const isRepairRunning = st.running && st.sync_type === "repair";
   const latest = !st.running && st.history && st.history.length ? st.history[0] : null;
   const bar = $("bar"), track = bar.parentElement;
   let trackCls = "progress", fillCls = "fill", label = "-", width = 0;
@@ -629,6 +633,11 @@ async function pollStatus() {
       fillCls += " warn";
       label = "本轮同步失败，请查看历史或日志";
     }
+  } else if (isRepairRunning) {
+    // Repair has no download counters to report; show the current phase
+    // with an indeterminate bar instead.
+    trackCls = "progress indeterminate";
+    label = `修复媒体库：${PHASES[st.phase] || st.phase}`;
   } else if (waitingForProgress) {
     trackCls = "progress indeterminate";
     label = `已处理 ${completed} 个文件 / 总数统计中…`;
@@ -728,6 +737,11 @@ $("trigger").addEventListener("click", () => {
   const mode = $("sync-type").value;
   if (mode === "full-strict") { strictPending = mode; openStrictDialog(); return; }
   triggerSync(mode, false);
+});
+$("repair").addEventListener("click", () => {
+  if (confirm("修复媒体库将跳过下载，以下载目录当前内容为权威，直接以“与 Alist 比较”的结果为准：强制覆盖媒体库中所有对应文件，并删除媒体库中已跟踪但不在比较结果中的文件。若下载缓存不完整（如全量重建未完成），媒体库将被同步为该不完整状态。确认执行？")) {
+    triggerSync("repair", false);
+  }
 });
 $("strict-cancel").addEventListener("click", () => { $("strict-dialog").close(); strictPending = null; });
 $("strict-confirm").addEventListener("click", () => {

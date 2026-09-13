@@ -210,9 +210,9 @@ func statusHTTPHandler(cp *controlPlane) http.Handler {
 			return
 		}
 		switch req.Mode {
-		case SyncTypeIncremental, SyncTypeFullRelaxed, SyncTypeFullStrict:
+		case SyncTypeIncremental, SyncTypeFullRelaxed, SyncTypeFullStrict, SyncTypeRepair:
 		default:
-			writeJSONError(w, http.StatusBadRequest, errCodeInvalidMode, "mode must be one of incremental, full-relaxed, full-strict")
+			writeJSONError(w, http.StatusBadRequest, errCodeInvalidMode, "mode must be one of incremental, full-relaxed, full-strict, repair")
 			return
 		}
 		if req.Mode == SyncTypeFullStrict && !req.Confirm {
@@ -373,6 +373,8 @@ func (cp *controlPlane) writeTriggerError(w http.ResponseWriter, err error) {
 		writeJSONError(w, http.StatusConflict, errCodeBusy, err.Error())
 	case errors.Is(err, errModeConflict):
 		writeJSONError(w, http.StatusConflict, errCodeModeConflict, errModeConflict.Error())
+	case errors.Is(err, errMediaDisabled):
+		writeJSONError(w, http.StatusConflict, errCodeModeConflict, errMediaDisabled.Error())
 	case errors.Is(err, errRecoveryPaused):
 		writeJSONError(w, http.StatusConflict, errCodeRecoveryPaused, errRecoveryPaused.Error())
 	case errors.Is(err, errConfirm):

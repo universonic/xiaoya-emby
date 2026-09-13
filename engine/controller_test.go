@@ -431,8 +431,27 @@ func TestControllerTriggerValidations(t *testing.T) {
 	if _, _, err := ctrl.Trigger(SyncTypeFullRelaxed, false); !errors.Is(err, errModeConflict) {
 		t.Fatalf("relaxed without download bit = %v, want errModeConflict", err)
 	}
+	// Repair only requires the media bit; the store is currently at
+	// modeBitMedia (download disabled), so it is accepted.
+	jobID, effective, err := ctrl.Trigger(SyncTypeRepair, false)
+	if err != nil || jobID == "" || effective != SyncTypeRepair {
+		t.Fatalf("repair trigger with media enabled = %q/%q/%v", jobID, effective, err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return globalStatus.snapshot().Running == false })
+
+	// Disabling the media bit rejects repair with errMediaDisabled.
+	noMedia := validSettings()
+	noMedia.RunMode = modeBitDownload
+	_, rev2 := store.Snapshot()
+	if _, _, err := store.Update(rev2, noMedia); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ctrl.Trigger(SyncTypeRepair, false); !errors.Is(err, errMediaDisabled) {
+		t.Fatalf("repair without media bit = %v, want errMediaDisabled", err)
+	}
+
 	// Incremental is accepted (the round itself is stubbed).
-	jobID, effective, err := ctrl.Trigger(SyncTypeIncremental, false)
+	jobID, effective, err = ctrl.Trigger(SyncTypeIncremental, false)
 	if err != nil || jobID == "" || effective != SyncTypeIncremental {
 		t.Fatalf("incremental trigger = %q/%q/%v", jobID, effective, err)
 	}
@@ -506,6 +525,180 @@ func TestControllerPendingRecoveryOverridesAndPauses(t *testing.T) {
 		snap := globalStatus.snapshot()
 		return snap.PendingRecovery && snap.RecoveryPaused
 	})
+}
+
+func TestControllerRepairIgnoresPendingRecovery(t *testing.T) {
+	resetGlobalStatus()
+	dir := t.TempDir()
+	store := NewSettingsStore(validSettings(), dir)
+	cfg := &Config{DownloadDir: dir}
+
+	// Seed a pending full rebuild state.
+	db, err := openMetadataDB(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := createMetaTable(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := createFullTables(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	st := &fullSyncState{
+		Version: fullStateVersion, SyncID: "fs-test", InventoryRunID: "inv-test",
+		Mode: fullModeStrict, Phase: fullPhaseDownloading,
+		Roots: []string{"电影"},
+	}
+	if err := writeFullSyncStateDB(ctx, db, st); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	var requestedSeen atomic.Value
+	ctrl := NewController(cfg, store)
+	ctrl.runRound = func(ctx context.Context, s SyncSettings, requested, trigger string, revision int64) (string, error) {
+		requestedSeen.Store(requested)
+		return OutcomeSuccess, nil
+	}
+	ctrl.Start()
+	defer ctrl.Stop()
+	waitForRoundDone(t)
+
+	// Repair is accepted and is not overridden by the pending recovery
+	// mode (unlike every other sync type).
+	_, effective, err := ctrl.Trigger(SyncTypeRepair, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective != SyncTypeRepair {
+		t.Fatalf("effective mode = %q, want repair (not overridden by pending full-strict)", effective)
+	}
+	waitFor(t, 5*time.Second, func() bool { return globalStatus.snapshot().Running == false })
+	if got := requestedSeen.Load(); got != SyncTypeRepair {
+		t.Fatalf("round ran with requested sync type %v, want repair", got)
+	}
+
+	// Disabling the download stage pauses recovery for other modes; repair
+	// is exempt and is still accepted.
+	settings, rev := store.Snapshot()
+	settings.RunMode = modeBitMedia
+	if _, _, err := store.Update(rev, settings); err != nil {
+		t.Fatal(err)
+	}
+	_, effective, err = ctrl.Trigger(SyncTypeRepair, false)
+	if err != nil {
+		t.Fatalf("repair rejected while recovery paused: %v", err)
+	}
+	if effective != SyncTypeRepair {
+		t.Fatalf("effective mode while paused = %q, want repair", effective)
+	}
+	waitFor(t, 5*time.Second, func() bool { return globalStatus.snapshot().Running == false })
+	if got := requestedSeen.Load(); got != SyncTypeRepair {
+		t.Fatalf("paused round ran with requested sync type %v, want repair", got)
+	}
+	snap := globalStatus.snapshot()
+	if !snap.PendingRecovery || !snap.RecoveryPaused {
+		t.Fatalf("pending state after repair = %+v, want pending+paused for other modes", snap)
+	}
+}
+
+func TestRepairSyncForcesOverwriteAndDeletes(t *testing.T) {
+	resetGlobalStatus()
+	downloadDir := t.TempDir()
+	mediaDir := t.TempDir()
+	ctx := context.Background()
+
+	// Download cache: DB rows plus disk files for A (kept, content changes)
+	// and B (new, not yet in the media library).
+	downDB := openTestDB(t, downloadDir)
+	if err := createFileTable(ctx, downDB); err != nil {
+		t.Fatal(err)
+	}
+	aRow := &MetadataFile{path: "/电影/a.mkv", name: "a.mkv", size: 3, modified: 1000, etag: `"ea"`, timeBase: timeBaseManifest, contentID: `"ea":3`, provenance: provenanceETag}
+	bRow := &MetadataFile{path: "/电影/b.nfo", name: "b.nfo", size: 1, modified: 1000, etag: `"eb"`, timeBase: timeBaseManifest, contentID: `"eb":1`, provenance: provenanceETag}
+	if err := insertTestRow(ctx, downDB, aRow); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertTestRow(ctx, downDB, bRow); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(downloadDir, "电影"), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "电影", "a.mkv"), []byte("new"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "电影", "b.nfo"), []byte("B"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	// Media library: A already exists with a DB row identical to the
+	// download DB row (same content ID/time base) but the file on disk was
+	// tampered with — this pins down that repair force-overwrites even a
+	// target that looks already up to date. C is a stale tracked file
+	// absent from the download DB and must be deleted.
+	mediaDB := openTestDB(t, mediaDir)
+	if err := createFileTable(ctx, mediaDB); err != nil {
+		t.Fatal(err)
+	}
+	mediaARow := &MetadataFile{path: "/电影/a.mkv", name: "a.mkv", size: 3, modified: 1000, etag: `"ea"`, timeBase: timeBaseManifest, contentID: `"ea":3`, provenance: provenanceETag}
+	cRow := &MetadataFile{path: "/电影/c.nfo", name: "c.nfo", size: 1, modified: 1000, etag: `"ec"`, timeBase: timeBaseManifest, contentID: `"ec":1`, provenance: provenanceETag}
+	if err := insertTestRow(ctx, mediaDB, mediaARow); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertTestRow(ctx, mediaDB, cRow); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(mediaDir, "电影"), dirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mediaDir, "电影", "a.mkv"), []byte("old"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mediaDir, "电影", "c.nfo"), []byte("C"), filePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	s := validSettings()
+	s.RunMode = modeBitDownload | modeBitMedia
+	s.Purge = false
+	// An unreachable mirror proves the download phase never runs: a
+	// regular incremental sync would fail in NewMetadataCrawler's mirror
+	// probe before ever reaching the compare phase.
+	s.MirrorURL = []string{"http://127.0.0.1:1/"}
+	cfg := &Config{DownloadDir: downloadDir, MediaDir: mediaDir}
+
+	if err := cfg.runSyncRoundOnce(ctx, s, SyncTypeRepair, 0); err != nil {
+		t.Fatalf("repair round failed: %v", err)
+	}
+
+	gotA, err := os.ReadFile(filepath.Join(mediaDir, "电影", "a.mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotA) != "new" {
+		t.Fatalf("media a.mkv content = %q, want forced overwrite to %q", gotA, "new")
+	}
+
+	if _, err := os.Stat(filepath.Join(mediaDir, "电影", "c.nfo")); !os.IsNotExist(err) {
+		t.Fatalf("stale tracked file c.nfo survived repair: err=%v", err)
+	}
+	mediaDB2 := openTestDB(t, mediaDir)
+	if n := countRows(t, mediaDB2, "SELECT COUNT(*) FROM files WHERE path = ?", "/电影/c.nfo"); n != 0 {
+		t.Fatalf("stale media db row for c.nfo survived repair: rows=%d", n)
+	}
+
+	gotB, err := os.ReadFile(filepath.Join(mediaDir, "电影", "b.nfo"))
+	if err != nil {
+		t.Fatalf("b.nfo was not copied to the media library: %v", err)
+	}
+	if string(gotB) != "B" {
+		t.Fatalf("b.nfo content = %q, want %q", gotB, "B")
+	}
+	if n := countRows(t, mediaDB2, "SELECT COUNT(*) FROM files WHERE path = ?", "/电影/b.nfo"); n != 1 {
+		t.Fatalf("b.nfo media db row missing: rows=%d", n)
+	}
 }
 
 func TestControllerRoundUsesSettingsSnapshot(t *testing.T) {

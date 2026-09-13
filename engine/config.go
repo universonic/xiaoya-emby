@@ -494,8 +494,11 @@ func (cfg *Config) verifyAlistTargets(ctx context.Context, s SyncSettings, alist
 // database and computes which files must be copied. Content identity is
 // decided per row: identical non-empty content IDs never re-copy; rows on
 // different or unknown time bases copy conservatively; only equal, known
-// bases may compare timestamps.
-func (cfg *Config) prepareMetadataUpdate(ctx context.Context, s SyncSettings, filesToPreserve map[string]bool) (map[string]bool, error) {
+// bases may compare timestamps. When forceCopy is set (metadata repair),
+// every preserved path with a download-DB row is copied unconditionally,
+// bypassing the content-ID/mtime skip logic; the deletion pass above is
+// unaffected.
+func (cfg *Config) prepareMetadataUpdate(ctx context.Context, s SyncSettings, filesToPreserve map[string]bool, forceCopy bool) (map[string]bool, error) {
 	if err := os.MkdirAll(cfg.MediaDir, dirPerm); err != nil {
 		return nil, err
 	}
@@ -571,6 +574,13 @@ func (cfg *Config) prepareMetadataUpdate(ctx context.Context, s SyncSettings, fi
 			return nil, err
 		}
 		if remoteFile == nil {
+			continue
+		}
+		if forceCopy {
+			// Repair: the preserve list is authoritative, so every row
+			// present in the download DB is force-copied regardless of
+			// content identity or timestamps.
+			filesNeedUpdate[remoteFile.Path()] = true
 			continue
 		}
 

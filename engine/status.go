@@ -43,6 +43,11 @@ const (
 	SyncTypeIncremental = "incremental"
 	SyncTypeFullRelaxed = "full-relaxed"
 	SyncTypeFullStrict  = "full-strict"
+	// SyncTypeRepair skips the download phase and treats the compare-phase
+	// result (against the download cache as-is) as authoritative for the
+	// media library: it force-copies every preserved file and deletes
+	// media-DB-tracked files that fall outside the preserve set.
+	SyncTypeRepair = "repair"
 )
 
 // Trigger sources of a sync round.

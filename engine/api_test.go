@@ -122,6 +122,17 @@ func TestAPISyncRequiresConfirmAndValidMode(t *testing.T) {
 	}
 }
 
+func TestAPISyncRepairAccepted(t *testing.T) {
+	h := newAPIHarness(t, "t0ken")
+	resp, payload := h.do("POST", "/api/sync", map[string]any{"mode": "repair"}, writeHdrWithToken("t0ken"))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("repair trigger = %d (%v)", resp.StatusCode, payload)
+	}
+	if payload["effective_mode"] != SyncTypeRepair {
+		t.Fatalf("repair effective_mode = %v", payload["effective_mode"])
+	}
+}
+
 func TestAPISyncAcceptedAndBusyConflict(t *testing.T) {
 	// The startup round returns instantly; later rounds block until
 	// released so the busy state is observable.
