@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +29,53 @@ const (
 	alistMaxPages   = 100_000
 	alistMaxEntries = 1_000_000
 )
+
+// errAlistRateLimited marks a transient Alist-side rate limit (e.g. the
+// provider rule:TooManyRequests surfaced as a 500). It is wrapped in the
+// api error so retry loops can detect it with errors.Is while the original
+// message stays intact for the final failure report.
+var errAlistRateLimited = errors.New("alist rate limited")
+
+// alistRateLimitRetries bounds automatic retries after a rate-limit
+// response. The delay doubles between attempts (alistRateLimitBaseDelay,
+// then 2x, 4x, ...) so concurrent repair workers back off instead of
+// hammering the API in lockstep. A var so tests can shrink the wait.
+const alistRateLimitRetries = 5
+
+var alistRateLimitBaseDelay = 2 * time.Second
+
+// retryRateLimit runs fn until it succeeds, fails with a non-rate-limit
+// error, or exhausts alistRateLimitRetries; between attempts it waits an
+// increasing, context-bound delay. The final error is returned unchanged.
+func (c *AlistClient) retryRateLimit(ctx context.Context, op, path string, fn func() error) error {
+	delay := alistRateLimitBaseDelay
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if !errors.Is(err, errAlistRateLimited) {
+			return err
+		}
+		if attempt > alistRateLimitRetries {
+			slog.Warn("Alist rate limit retries exhausted", "op", op, "path", path, "retries", alistRateLimitRetries, "err", err)
+			return err
+		}
+		wait := jitteredBackoff(delay)
+		slog.Warn("Alist rate limited, waiting to retry", "op", op, "path", path, "attempt", attempt, "max", alistRateLimitRetries, "delay", wait)
+		if serr := sleepContext(ctx, wait); serr != nil {
+			return &fs.PathError{Op: op, Path: path, Err: serr}
+		}
+		delay *= 2
+	}
+}
+
+// jitteredBackoff keeps each wait between half and all of the exponential
+// delay so concurrent workers spread out without losing progressive backoff.
+func jitteredBackoff(delay time.Duration) time.Duration {
+	if delay <= 1 {
+		return delay
+	}
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(delay-half)+1))
+}
 
 type AlistClient struct {
 	Endpoint *url.URL
@@ -76,6 +125,9 @@ func (c *AlistClient) doPOST(ctx context.Context, opName, apiPath, path string, 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = errors.New(resp.Status)
 			resp.Body.Close()
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return nil, &fs.PathError{Op: opName, Path: path, Err: fmt.Errorf("%w: %w", errAlistRateLimited, lastErr)}
+			}
 			if serr := sleepContext(ctx, 3*time.Second); serr != nil {
 				return nil, &fs.PathError{Op: opName, Path: path, Err: serr}
 			}
@@ -93,13 +145,22 @@ func (c *AlistClient) doPOST(ctx context.Context, opName, apiPath, path string, 
 }
 
 func (c *AlistClient) get(ctx context.Context, path string) (*AlistGetResult, error) {
-	body, err := c.doPOST(ctx, "Get", "api/fs/get", path, AlistGetPayload{Path: path})
+	r := &AlistGetResult{}
+	err := c.retryRateLimit(ctx, "Get", path, func() error {
+		body, err := c.doPOST(ctx, "Get", "api/fs/get", path, AlistGetPayload{Path: path})
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(body, r); err != nil {
+			return &fs.PathError{Op: "Get", Path: path, Err: err}
+		}
+		if err := alistCodeError(r.Code, r.Message); err != nil {
+			return &fs.PathError{Op: "Get", Path: path, Err: err}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	r := &AlistGetResult{}
-	if err := json.Unmarshal(body, r); err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
 	}
 	return r, nil
 }
@@ -108,9 +169,6 @@ func (c *AlistClient) Stat(ctx context.Context, path string) (os.FileInfo, error
 	r, err := c.get(ctx, path)
 	if err != nil {
 		return nil, err
-	}
-	if err := alistCodeError(r.Code, r.Message); err != nil {
-		return nil, &fs.PathError{Op: "Get", Path: path, Err: err}
 	}
 	if r.Data == nil {
 		return nil, &fs.PathError{Op: "Get", Path: path, Err: fmt.Errorf("alist get returned no data for %s", path)}
@@ -125,25 +183,35 @@ func (c *AlistClient) Stat(ctx context.Context, path string) (os.FileInfo, error
 }
 
 func (c *AlistClient) list(ctx context.Context, path string, page, perPage int) (*AlistListResult, error) {
-	body, err := c.doPOST(ctx, "List", "api/fs/list", path, AlistListPayload{
-		Path:    path,
-		Page:    page,
-		PerPage: perPage,
+	r := &AlistListResult{}
+	err := c.retryRateLimit(ctx, "List", path, func() error {
+		body, err := c.doPOST(ctx, "List", "api/fs/list", path, AlistListPayload{
+			Path:    path,
+			Page:    page,
+			PerPage: perPage,
+		})
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(body, r); err != nil {
+			return &fs.PathError{Op: "List", Path: path, Err: err}
+		}
+		if err := alistCodeError(r.Code, r.Message); err != nil {
+			return &fs.PathError{Op: "List", Path: path, Err: err}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	r := &AlistListResult{}
-	if err := json.Unmarshal(body, r); err != nil {
-		return nil, &fs.PathError{Op: "List", Path: path, Err: err}
 	}
 	return r, nil
 }
 
 // alistCodeError classifies Alist API result codes: success is 200; an
-// object-not-found response is fs.ErrNotExist; anything else is a hard
-// error that must fail the verification phase (never silently produce a
-// deletion plan). The match is limited to object-level not-found phrases
+// object-not-found response is fs.ErrNotExist; a transient rate limit is
+// wrapped with errAlistRateLimited so callers retry it; anything else is a
+// hard error that must fail the verification phase (never silently produce
+// a deletion plan). The match is limited to object-level not-found phrases
 // so that infrastructure errors like "storage not found" (a disabled or
 // missing storage driver) are never treated as a missing object.
 func alistCodeError(code int, message string) error {
@@ -154,7 +222,14 @@ func alistCodeError(code int, message string) error {
 	if strings.Contains(msg, "object not found") || strings.Contains(msg, "path not found") {
 		return fs.ErrNotExist
 	}
-	return fmt.Errorf("alist api error %d: %s", code, message)
+	err := fmt.Errorf("alist api error %d: %s", code, message)
+	// Alist surfaces provider throttling as a 500 whose message embeds the
+	// upstream marker (e.g. "rule:TooManyRequests"); HTTP 429 needs no
+	// message at all. Both are transient and safe to retry.
+	if code == http.StatusTooManyRequests || strings.Contains(msg, "toomanyrequests") || strings.Contains(msg, "too many requests") {
+		return fmt.Errorf("%w: %w", errAlistRateLimited, err)
+	}
+	return err
 }
 
 // ReadDir lists a directory with full pagination validation: the API code
@@ -174,9 +249,6 @@ func (c *AlistClient) ReadDir(ctx context.Context, path string) ([]os.FileInfo, 
 		r, err := c.list(ctx, path, i, 1024)
 		if err != nil {
 			return nil, err
-		}
-		if err := alistCodeError(r.Code, r.Message); err != nil {
-			return nil, &fs.PathError{Op: "List", Path: path, Err: err}
 		}
 		if r.Data == nil {
 			return nil, &fs.PathError{Op: "List", Path: path, Err: fmt.Errorf("alist list returned no data for %s", path)}

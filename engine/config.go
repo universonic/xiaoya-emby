@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -392,6 +393,8 @@ func (cfg *Config) verifyAlistTargets(ctx context.Context, s SyncSettings, alist
 	if len(alistToScan) == 0 {
 		return nil
 	}
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	defer cancelScan()
 	client, err := NewAlistClient(s.AlistURL)
 	if err != nil {
 		return err
@@ -417,7 +420,7 @@ func (cfg *Config) verifyAlistTargets(ctx context.Context, s SyncSettings, alist
 				path  string
 				files map[string]string
 			}{path, files}:
-			case <-ctx.Done():
+			case <-scanCtx.Done():
 				return
 			}
 		}
@@ -428,10 +431,10 @@ func (cfg *Config) verifyAlistTargets(ctx context.Context, s SyncSettings, alist
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if ctx.Err() != nil {
+				if scanCtx.Err() != nil {
 					return
 				}
-				infos, err := client.ReadDir(ctx, job.path)
+				infos, err := client.ReadDir(scanCtx, job.path)
 				mux.Lock()
 				if err != nil {
 					switch {
@@ -449,6 +452,9 @@ func (cfg *Config) verifyAlistTargets(ctx context.Context, s SyncSettings, alist
 						// deletion plan.
 						if firstErr == nil {
 							firstErr = fmt.Errorf("cannot verify stream folder %s on Alist: %w", job.path, err)
+						}
+						if errors.Is(err, errAlistRateLimited) {
+							cancelScan()
 						}
 					}
 					mux.Unlock()
